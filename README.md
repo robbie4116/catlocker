@@ -12,16 +12,19 @@
     <img src="./thumbnail.png" />
 </p>
 
-## 🎛️ Config file
+## 🎛️ Config File
 
-You can make a file called `keylock.config` in the directory where the executable is. It will be used by the app to load the settings. All config options are:
+You can make a file called `keylock.toml` in the directory where the executable is. It will be used by the app to load the settings. All config options are:
 
 ```
-&unlock@!@ctrl+q                # Shortcut to unlock (Examples: ctrl+q, alt+s, shift+ctrl+q)
-&onstart_lock_keyboard@!@false  # Lock keyboard on start (true or false)
-&onstart_lock_mouse@!@false     # Lock mouse on start (true or false)
-&refresh_rate@!@1500            # Check for lock every x milliseconds (integer only)
-&quit_after@!@never             # Exit app after some time (never or number in milliseconds, examples: 1000, 5000, never)
+[general]
+unlock = "ctrl+q"     - Shortcut to unlock (examples: ctrl+q, alt+s, shift+ctrl+q)
+refresh_rate = 1500   - Check for lock state every x milliseconds (integer only)
+quit_after = "never"  - Exit app after some time ("never" or milliseconds as integer, e.g. 5000)
+
+[startup]
+lock_keyboard = false - Lock keyboard on launch (true or false)
+lock_mouse = false    - Lock mouse on launch (true or false)
 ```
 
 > [!Important]

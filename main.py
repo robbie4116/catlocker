@@ -6,7 +6,7 @@ import tkinter as tk
 from core import lock_keyboard, lock_mouse
 from settings import open_config, save_config
 
-config = open_config("keylock.config")
+config = open_config()
 refresh_rate = 1500
 
 if os.name == "nt":
@@ -83,18 +83,13 @@ shortcut = tk.Entry(
 
 shortcut.place(x=199, y=304, width=135, height=26)
 
-if config:
-    if config.get("onstart_lock_keyboard", "").lower() == "true":
-        lock_keyboard()
-    if config.get("onstart_lock_mouse", "").lower() == "true":
-        lock_mouse()
-    if config.get("quit_after", "never").lower() != "never":
-        root.after(int(config["quit_after"]), sys.exit)
-    if config.get("refresh_rate", "1500").lower() != "1500":
-        refresh_rate = int(config["refresh_rate"])
-    shortcut.insert(0, config.get("unlock", "ctrl+q"))
-else:
-    shortcut.insert(0, "ctrl+q")
+if config["startup"]["lock_keyboard"]:
+    lock_keyboard()
+if config["startup"]["lock_mouse"]:
+    lock_mouse()
+if config["general"]["quit_after"] != "never":
+    root.after(int(config["general"]["quit_after"]), sys.exit)
+shortcut.insert(0, config["general"]["unlock"])
 
 debounce_timer = None
 
@@ -114,7 +109,7 @@ def check_change():
         update_keyboard()
         update_mouse()
         core.changed = False
-    root.after(refresh_rate, check_change)
+    root.after(config["general"]["refresh_rate"], check_change)
 
 
 threading.Thread(target=check_change, daemon=True).start()
