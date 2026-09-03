@@ -22,6 +22,7 @@ WM_QUIT = 0x0012
 WM_APP_COMMAND = 0x8001
 PM_NOREMOVE = 0x0000
 LLKHF_INJECTED = 0x10
+MAX_SAFE_TIMEOUT = threading.TIMEOUT_MAX
 
 ULONG_PTR = ctypes.c_size_t
 LRESULT = ctypes.c_ssize_t
@@ -112,8 +113,11 @@ def _require_finite_timeout(timeout: float, operation: str) -> float:
         raise ValueError(
             f"{operation} timeout must be finite and non-negative."
         ) from exc
-    if not math.isfinite(value) or value < 0:
-        raise ValueError(f"{operation} timeout must be finite and non-negative.")
+    if not math.isfinite(value) or value < 0 or value > MAX_SAFE_TIMEOUT:
+        raise ValueError(
+            f"{operation} timeout must be finite and non-negative, "
+            f"and no greater than {MAX_SAFE_TIMEOUT}."
+        )
     return value
 
 
@@ -305,6 +309,9 @@ class KeyboardHook:
         self.shortcut_generation = 0
 
         self._hook_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._fail_open_pending = threading.Event()
+        self._callback_failure: BaseException | None = None
         self._startup_condition = threading.Condition()
         self._startup_cancelled = threading.Event()
         self._pending_lock = threading.Lock()
@@ -314,9 +321,10 @@ class KeyboardHook:
 
     @property
     def locked(self) -> bool:
-        if self.fail_open.is_set():
-            return False
-        return self.state.locked
+        with self._state_lock:
+            if self._fail_open_active():
+                return False
+            return self.state.locked
 
     def is_alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
@@ -337,7 +345,7 @@ class KeyboardHook:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self._startup_cancelled.set()
-                    self.fail_open.set()
+                    self._force_fail_open_unlocked()
                     self._startup_condition.notify_all()
                     raise HookTimeout("Timed out starting keyboard hook.")
                 self._startup_condition.wait(remaining)
@@ -348,8 +356,7 @@ class KeyboardHook:
         timeout = _require_finite_timeout(timeout, "stop")
         thread = self.thread
         if thread is None:
-            self.fail_open.set()
-            self.state.set_locked(False)
+            self._force_fail_open_unlocked()
             self._raise_cleanup_error_if_needed()
             return
         if thread is threading.current_thread():
@@ -358,7 +365,7 @@ class KeyboardHook:
         deadline = time.monotonic() + timeout
         stop_error: HookStopped | HookTimeout | None = None
         if thread.is_alive() and self.installation_exception is None:
-            self.fail_open.set()
+            self._force_fail_open_unlocked()
             remaining = max(0.0, deadline - time.monotonic())
             try:
                 self.submit(CommandKind.STOP, timeout=remaining)
@@ -383,7 +390,7 @@ class KeyboardHook:
         timeout = _require_finite_timeout(timeout, "submit")
         if not isinstance(kind, CommandKind):
             raise ValueError("Unknown keyboard hook command.")
-        if self.fail_open.is_set() and kind not in (
+        if self._fail_open_active() and kind not in (
             CommandKind.FAIL_OPEN,
             CommandKind.STOP,
         ):
@@ -392,7 +399,7 @@ class KeyboardHook:
             raise HookStopped("Keyboard hook thread is not running.")
 
         if kind in (CommandKind.FAIL_OPEN, CommandKind.STOP):
-            self.fail_open.set()
+            self._force_fail_open_unlocked()
 
         reply: queue.SimpleQueue[CommandResult] = queue.SimpleQueue()
         command = self._create_command(kind, payload, reply)
@@ -418,7 +425,8 @@ class KeyboardHook:
             return result
 
     def enter_fail_open(self) -> None:
-        self.fail_open.set()
+        with self._state_lock:
+            self._enter_fail_open_locked("fail_open")
         if not self.is_alive() or self.thread_id is None:
             return
         command = self._create_command(CommandKind.FAIL_OPEN)
@@ -493,7 +501,7 @@ class KeyboardHook:
                 with self._hook_lock:
                     self.hook_handle = handle
                 if self._startup_cancelled.is_set():
-                    self.fail_open.set()
+                    self._force_fail_open_unlocked()
                     cancel_install = True
                 else:
                     self.ready.set()
@@ -506,7 +514,7 @@ class KeyboardHook:
             if not self.ready.is_set():
                 with self._startup_condition:
                     self.installation_exception = exc
-                    self.fail_open.set()
+                    self._force_fail_open_unlocked()
                     self.ready.set()
                     self._startup_condition.notify_all()
             else:
@@ -516,8 +524,7 @@ class KeyboardHook:
                 self.ready.set()
                 self._startup_condition.notify_all()
             self._stop_requested.set()
-            self.fail_open.set()
-            self._force_unlocked()
+            self._force_fail_open_unlocked()
             self._unhook_owner()
             self._reject_pending_commands()
 
@@ -557,7 +564,7 @@ class KeyboardHook:
         result = CommandResult(
             command.command_id,
             accepted,
-            False if self.fail_open.is_set() else self.state.locked,
+            self.locked,
             self.shortcut_generation,
         )
         if command.reply is not None:
@@ -565,39 +572,33 @@ class KeyboardHook:
 
     def _run_command(self, command: HookCommand) -> bool:
         if command.kind is CommandKind.STOP:
-            self.fail_open.set()
-            self._force_unlocked()
+            self._force_fail_open_unlocked()
             self._stop_requested.set()
             accepted = self._unhook_owner()
             self._post_quit_owner()
             return accepted
         if command.kind is CommandKind.FAIL_OPEN:
-            self.fail_open.set()
-            committed, transition = command.lifecycle.commit(
-                lambda: self.state.set_locked(False)
-            )
-            if not committed:
-                return False
-            if transition.changed:
-                self.events.put(EngineEvent("state", False, "fail_open"))
-            return True
-        if self.fail_open.is_set():
+            with self._state_lock:
+                self._enter_fail_open_locked("fail_open")
+                committed, _ = command.lifecycle.commit(lambda: None)
+                return committed
+        if self._fail_open_active():
             return False
         if command.kind is CommandKind.SET_LOCKED:
-            committed, transition = command.lifecycle.commit(
+            committed, transition = self._commit_state_command(
+                command,
                 lambda: self.state.set_locked(bool(command.payload))
             )
             if not committed:
                 return False
-            self._publish_transition(transition)
             return True
         if command.kind is CommandKind.TOGGLE:
-            committed, transition = command.lifecycle.commit(
+            committed, transition = self._commit_state_command(
+                command,
                 lambda: self.state.set_locked(not self.state.locked)
             )
             if not committed:
                 return False
-            self._publish_transition(transition)
             return True
         if command.kind is CommandKind.REPLACE_SHORTCUT:
             def replace_shortcut():
@@ -606,29 +607,109 @@ class KeyboardHook:
                     self.shortcut_generation += 1
                 return accepted
 
-            committed, accepted = command.lifecycle.commit(replace_shortcut)
+            committed, accepted = self._commit_command(command, replace_shortcut)
             if not committed:
                 return False
             return accepted
         if command.kind is CommandKind.ENTER_RECORDING:
-            committed, accepted = command.lifecycle.commit(
+            committed, accepted = self._commit_command(
+                command,
                 self.state.enter_recording
             )
             return committed and accepted
         if command.kind is CommandKind.EXIT_RECORDING:
-            committed, _ = command.lifecycle.commit(self.state.exit_recording)
+            committed, _ = self._commit_command(command, self.state.exit_recording)
             return committed
         return False
 
+    def _commit_command(self, command: HookCommand, operation):
+        with self._state_lock:
+            if self._enter_pending_fail_open_locked() or self._fail_open_active():
+                return False, None
+            committed, result = command.lifecycle.commit(operation)
+            if committed and self._fail_open_active():
+                if not self._enter_pending_fail_open_locked():
+                    self._enter_fail_open_locked("fail_open")
+                return False, result
+            return committed, result
+
+    def _commit_state_command(self, command: HookCommand, operation):
+        with self._state_lock:
+            if self._enter_pending_fail_open_locked() or self._fail_open_active():
+                return False, None
+            committed, transition = command.lifecycle.commit(operation)
+            if committed:
+                if self._fail_open_active():
+                    if not self._enter_pending_fail_open_locked():
+                        self._enter_fail_open_locked("fail_open")
+                    return False, transition
+                self._publish_transition(transition)
+            return committed, transition
+
     def _publish_transition(self, transition) -> None:
-        if transition.changed:
-            self.events.put(
+        if transition.changed and not (transition.locked and self._fail_open_active()):
+            self._put_event_safely(
                 EngineEvent("state", transition.locked, transition.reason)
             )
 
     def _force_unlocked(self) -> None:
+        with self._state_lock:
+            try:
+                self.state.set_locked(False)
+            except BaseException:
+                self.state.locked = False
+
+    def _force_fail_open_unlocked(self) -> None:
+        with self._state_lock:
+            self.fail_open.set()
+            try:
+                self.state.set_locked(False)
+            except BaseException:
+                self.state.locked = False
+
+    def _enter_fail_open_locked(self, reason: str) -> None:
+        self._enter_fail_open_locked_with_error(reason, None)
+
+    def _enter_fail_open_locked_with_error(
+        self,
+        reason: str,
+        error: BaseException | None,
+    ) -> None:
         try:
-            self.state.set_locked(False)
+            self.fail_open.set()
+        except BaseException:
+            pass
+        transition = None
+        try:
+            transition = self.state.set_locked(False)
+        except BaseException:
+            try:
+                self.state.locked = False
+            except BaseException:
+                pass
+        try:
+            if transition is not None and transition.changed:
+                self._put_event_safely(EngineEvent("state", False, reason))
+        except BaseException:
+            pass
+        if error is not None:
+            self._put_event_safely(EngineEvent("fatal", False, reason, error))
+
+    def _fail_open_active(self) -> bool:
+        return self.fail_open.is_set() or self._fail_open_pending.is_set()
+
+    def _enter_pending_fail_open_locked(self) -> bool:
+        if not self._fail_open_pending.is_set():
+            return False
+        error = self._callback_failure
+        self._callback_failure = None
+        self._fail_open_pending.clear()
+        self._enter_fail_open_locked_with_error("callback", error)
+        return True
+
+    def _put_event_safely(self, event: EngineEvent) -> None:
+        try:
+            self.events.put(event)
         except BaseException:
             pass
 
@@ -654,34 +735,104 @@ class KeyboardHook:
                 )
 
     def _callback(self, n_code, w_param, l_param):
-        if n_code < HC_ACTION or self.fail_open.is_set():
-            return self.api.call_next(self.hook_handle, n_code, w_param, l_param)
+        acquired = False
         try:
-            data = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-            event = event_from_message(int(w_param), data)
-            if event is None:
-                return self.api.call_next(self.hook_handle, n_code, w_param, l_param)
-            transition = self.state.handle(event)
-            if transition.changed:
-                self.events.put(EngineEvent("state", transition.locked, transition.reason))
-            if transition.suppress:
-                return 1
-            return self.api.call_next(self.hook_handle, n_code, w_param, l_param)
-        except BaseException as exc:
-            self.fail_open.set()
-            self.state.set_locked(False)
-            self.events.put(EngineEvent("fatal", False, "callback", exc))
-            return self.api.call_next(self.hook_handle, n_code, w_param, l_param)
+            if n_code < HC_ACTION or self._fail_open_active():
+                return self._call_next_or_zero(n_code, w_param, l_param)
+            acquired = self._state_lock.acquire(blocking=False)
+            if not acquired:
+                return self._call_next_or_zero(n_code, w_param, l_param)
 
-    def _fail_open(self, reason: str, error: BaseException) -> None:
-        self.fail_open.set()
+            suppress = False
+            try:
+                if not self._fail_open_active():
+                    data = ctypes.cast(
+                        l_param,
+                        ctypes.POINTER(KBDLLHOOKSTRUCT),
+                    ).contents
+                    event = event_from_message(int(w_param), data)
+                    if event is not None and not self._fail_open_active():
+                        transition = self.state.handle(event)
+                        if transition.changed:
+                            self.events.put(
+                                EngineEvent(
+                                    "state",
+                                    transition.locked,
+                                    transition.reason,
+                                )
+                            )
+                        suppress = transition.suppress
+            except BaseException as exc:
+                self._fail_open_locked_safely(exc)
+                callback_error = exc
+            else:
+                callback_error = None
+            finally:
+                try:
+                    self._state_lock.release()
+                except BaseException:
+                    pass
+                acquired = False
+            if callback_error is not None:
+                return self._call_next_or_zero(n_code, w_param, l_param)
+            if suppress:
+                return 1
+            return self._call_next_or_zero(n_code, w_param, l_param)
+        except BaseException as exc:
+            self._request_callback_fail_open(exc)
+            return 0
+        finally:
+            if acquired:
+                try:
+                    self._state_lock.release()
+                except BaseException:
+                    pass
+
+    def _call_next_or_zero(self, n_code, w_param, l_param) -> int:
         try:
-            transition = self.state.set_locked(False)
-            if transition.changed:
-                self.events.put(EngineEvent("state", False, transition.reason))
+            return self.api.call_next(
+                self.hook_handle,
+                n_code,
+                w_param,
+                l_param,
+            )
+        except BaseException as exc:
+            self._callback_fail_open(exc)
+            return 0
+
+    def _callback_fail_open(self, error: BaseException) -> None:
+        self._request_callback_fail_open(error)
+
+    def _fail_open_locked_safely(self, error: BaseException) -> None:
+        try:
+            self._enter_fail_open_locked_with_error("callback", error)
         except BaseException:
             pass
-        self.events.put(EngineEvent("fatal", False, reason, error))
+
+    def _request_callback_fail_open(self, error: BaseException) -> None:
+        acquired = False
+        try:
+            acquired = self._state_lock.acquire(blocking=False)
+            if acquired:
+                self._callback_failure = None
+                self._fail_open_pending.clear()
+                self._enter_fail_open_locked_with_error("callback", error)
+            else:
+                self._callback_failure = error
+                self._fail_open_pending.set()
+        except BaseException:
+            pass
+        finally:
+            if acquired:
+                try:
+                    self._state_lock.release()
+                except BaseException:
+                    pass
+
+    def _fail_open(self, reason: str, error: BaseException) -> None:
+        with self._state_lock:
+            self._enter_pending_fail_open_locked()
+            self._enter_fail_open_locked_with_error(reason, error)
 
     def _raise_cleanup_error_if_needed(self) -> None:
         error = self.cleanup_exception
@@ -692,8 +843,8 @@ class KeyboardHook:
 
     def _report_cleanup_error(self, error: BaseException) -> None:
         self.cleanup_exception = error
-        self.fail_open.set()
-        self.events.put(EngineEvent("fatal", False, "cleanup", error))
+        self._force_fail_open_unlocked()
+        self._put_event_safely(EngineEvent("fatal", False, "cleanup", error))
 
     def _unhook_owner(self) -> bool:
         with self._hook_lock:

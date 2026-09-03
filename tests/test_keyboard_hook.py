@@ -213,6 +213,25 @@ class PausingBeforeCommitHook(KeyboardHook):
                 self.command_finished.set()
 
 
+class RecordingEvents:
+    def __init__(self, marker):
+        self.marker = marker
+        self.events = queue.SimpleQueue()
+        self.records = []
+
+    def put(self, event):
+        self.records.append((self.marker.is_set(), event))
+        self.events.put(event)
+
+    def get_nowait(self):
+        return self.events.get_nowait()
+
+
+class RaisingEvents:
+    def put(self, event):
+        raise RuntimeError("event publication failed")
+
+
 @pytest.mark.parametrize(
     ("message", "is_keydown"),
     [
@@ -371,6 +390,46 @@ def test_stop_rejects_unbounded_or_nonfinite_timeout(timeout):
         hook.stop(timeout=1)
 
 
+@pytest.mark.parametrize("timeout", [-1, 1e308])
+def test_start_rejects_unsafe_timeout_before_worker_or_hook_side_effect(timeout):
+    api = FakeWin32Api()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api)
+
+    with pytest.raises(ValueError, match="finite"):
+        hook.start(timeout=timeout)
+
+    assert hook.thread is None
+    assert api.install_calls == 0
+    assert api.active_hooks == set()
+    assert not hook.fail_open.is_set()
+
+
+@pytest.mark.parametrize("timeout", [-1, 1e308])
+def test_submit_rejects_unsafe_timeout_before_posting(timeout):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        with pytest.raises(ValueError, match="finite"):
+            hook.submit(CommandKind.SET_LOCKED, True, timeout=timeout)
+        assert api.post_thread_message_calls == []
+        assert hook.state.locked is False
+    finally:
+        hook.stop(timeout=1)
+
+
+@pytest.mark.parametrize("timeout", [-1, 1e308])
+def test_stop_rejects_unsafe_timeout_before_stopping(timeout):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        with pytest.raises(ValueError, match="finite"):
+            hook.stop(timeout=timeout)
+        assert hook.is_alive()
+        assert api.post_thread_message_calls == []
+    finally:
+        hook.stop(timeout=1)
+
+
 def test_stop_timeout_is_bounded_and_thread_is_daemon():
     api = BlockingGetMessageApi()
     hook = started_hook(api, "F24")
@@ -490,6 +549,228 @@ def test_callback_exception_poisoning_passes_all_later_events(monkeypatch):
         assert hook.fail_open.is_set()
         assert hook.events.get_nowait().kind == "fatal"
     finally:
+        hook.stop(timeout=1)
+
+
+def test_callback_state_failure_never_escapes(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    structure = KBDLLHOOKSTRUCT(vkCode=0x41)
+    try:
+        monkeypatch.setattr(
+            hook.state,
+            "handle",
+            lambda event: (_ for _ in ()).throw(RuntimeError("state failed")),
+        )
+        monkeypatch.setattr(
+            hook.state,
+            "set_locked",
+            lambda locked: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+        )
+
+        assert hook._callback(
+            HC_ACTION,
+            WM_KEYDOWN,
+            ctypes.addressof(structure),
+        ) == api.call_next_return
+        assert hook.fail_open.is_set()
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_callback_failure_survives_event_and_call_next_failures(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    structure = KBDLLHOOKSTRUCT(vkCode=0x41)
+    try:
+        monkeypatch.setattr(
+            hook.state,
+            "handle",
+            lambda event: (_ for _ in ()).throw(RuntimeError("state failed")),
+        )
+        hook.events = RaisingEvents()
+        monkeypatch.setattr(
+            api,
+            "call_next",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("next failed")),
+        )
+
+        assert hook._callback(
+            HC_ACTION,
+            WM_KEYDOWN,
+            ctypes.addressof(structure),
+        ) == 0
+        assert hook.fail_open.is_set()
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_callback_initial_call_next_failure_returns_fail_open_result(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    structure = KBDLLHOOKSTRUCT(vkCode=0x41)
+    try:
+        monkeypatch.setattr(
+            api,
+            "call_next",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("next failed")),
+        )
+
+        assert hook._callback(
+            -1,
+            WM_KEYDOWN,
+            ctypes.addressof(structure),
+        ) == 0
+        assert hook.fail_open.is_set()
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_callback_failure_does_not_wait_for_state_lock(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    callback_result = []
+    try:
+        monkeypatch.setattr(
+            api,
+            "call_next",
+            lambda *args: (_ for _ in ()).throw(RuntimeError("next failed")),
+        )
+        assert hook._state_lock.acquire(blocking=False)
+        callback_thread = threading.Thread(
+            target=lambda: callback_result.append(
+                hook._callback(-1, WM_KEYDOWN, 0)
+            )
+        )
+        callback_thread.start()
+        assert callback_thread.join(timeout=0.2) is None
+        assert not callback_thread.is_alive()
+        assert callback_result == [0]
+        assert not hook.fail_open.is_set()
+        assert hook._fail_open_pending.is_set()
+        hook._state_lock.release()
+        assert hook.submit(CommandKind.FAIL_OPEN, timeout=1).accepted is True
+        assert hook.fail_open.is_set()
+    finally:
+        if hook._state_lock.locked():
+            hook._state_lock.release()
+        hook.stop(timeout=1)
+
+
+def test_fail_open_serializes_paused_command_state_commit(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    state_commit_started = threading.Event()
+    release_state_commit = threading.Event()
+    fail_open_invoked = threading.Event()
+    fail_open_finished = threading.Event()
+    hook.events = RecordingEvents(fail_open_finished)
+    original_set_locked = hook.state.set_locked
+
+    def paused_set_locked(locked):
+        if locked:
+            state_commit_started.set()
+            if not release_state_commit.wait(timeout=1):
+                raise AssertionError("test did not release state commit")
+        return original_set_locked(locked)
+
+    monkeypatch.setattr(hook.state, "set_locked", paused_set_locked)
+    command_result = []
+    fail_open_thread = None
+    try:
+        command_thread = threading.Thread(
+            target=lambda: command_result.append(
+                hook.submit(CommandKind.SET_LOCKED, True, timeout=1)
+            )
+        )
+        command_thread.start()
+        assert state_commit_started.wait(timeout=1)
+
+        def enter_fail_open():
+            fail_open_invoked.set()
+            hook.enter_fail_open()
+            fail_open_finished.set()
+
+        fail_open_thread = threading.Thread(target=enter_fail_open)
+        fail_open_thread.start()
+        assert fail_open_invoked.wait(timeout=1)
+        release_state_commit.set()
+        command_thread.join(timeout=1)
+        fail_open_thread.join(timeout=1)
+
+        assert not command_thread.is_alive()
+        assert not fail_open_thread.is_alive()
+        assert len(command_result) == 1
+        hook.submit(CommandKind.FAIL_OPEN, timeout=1)
+        assert hook.state.locked is False
+        assert not any(
+            marked and event.kind == "state" and event.locked
+            for marked, event in hook.events.records
+        )
+    finally:
+        release_state_commit.set()
+        if fail_open_thread is not None:
+            fail_open_thread.join(timeout=1)
+        hook.stop(timeout=1)
+
+
+def test_fail_open_serializes_paused_callback_state_transition(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    state_transition_started = threading.Event()
+    release_state_transition = threading.Event()
+    fail_open_invoked = threading.Event()
+    fail_open_finished = threading.Event()
+    hook.events = RecordingEvents(fail_open_finished)
+    original_handle = hook.state.handle
+
+    def paused_handle(event):
+        state_transition_started.set()
+        if not release_state_transition.wait(timeout=1):
+            raise AssertionError("test did not release callback transition")
+        return original_handle(event)
+
+    monkeypatch.setattr(hook.state, "handle", paused_handle)
+    callback_results = []
+    fail_open_thread = None
+    try:
+        callback_thread = threading.Thread(
+            target=lambda: callback_results.append(
+                api.emit(
+                    HC_ACTION,
+                    WM_KEYDOWN,
+                    KBDLLHOOKSTRUCT(vkCode=0x87),
+                )
+            )
+        )
+        callback_thread.start()
+        assert state_transition_started.wait(timeout=1)
+
+        def enter_fail_open():
+            fail_open_invoked.set()
+            hook.enter_fail_open()
+            fail_open_finished.set()
+
+        fail_open_thread = threading.Thread(target=enter_fail_open)
+        fail_open_thread.start()
+        assert fail_open_invoked.wait(timeout=1)
+        release_state_transition.set()
+        callback_thread.join(timeout=1)
+        fail_open_thread.join(timeout=1)
+
+        assert not callback_thread.is_alive()
+        assert not fail_open_thread.is_alive()
+        assert callback_results == [1]
+        hook.submit(CommandKind.FAIL_OPEN, timeout=1)
+        assert hook.state.locked is False
+        assert not any(
+            marked and event.kind == "state" and event.locked
+            for marked, event in hook.events.records
+        )
+    finally:
+        release_state_transition.set()
+        if fail_open_thread is not None:
+            fail_open_thread.join(timeout=1)
         hook.stop(timeout=1)
 
 
