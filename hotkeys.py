@@ -89,6 +89,87 @@ class Shortcut:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class KeyEvent:
+    vk: int
+    is_keydown: bool
+    injected: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class Transition:
+    suppress: bool
+    locked: bool
+    changed: bool = False
+    reason: str | None = None
+
+
+class InputState:
+    def __init__(self, shortcut: Shortcut, *, locked: bool = False):
+        self.shortcut = shortcut
+        self.locked = locked
+        self.pressed: set[int] = set()
+        self.passed_down: set[int] = set()
+        self.suppressed_down: set[int] = set()
+        self.toggle_latched = False
+        self.emergency_latched = False
+        self.recording = False
+
+    def set_locked(self, locked: bool) -> Transition:
+        changed = self.locked != locked
+        self.locked = locked
+        if locked:
+            self.recording = False
+        return Transition(False, self.locked, changed, "command" if changed else None)
+
+    def handle(self, event: KeyEvent) -> Transition:
+        return self._handle_down(event) if event.is_keydown else self._handle_up(event)
+
+    def _handle_down(self, event: KeyEvent) -> Transition:
+        if event.vk in self.pressed:
+            return Transition(self.locked, self.locked)
+
+        self.pressed.add(event.vk)
+        previous_locked = self.locked
+        reason = None
+        if (
+            {VK_LCONTROL, VK_RCONTROL} <= self.pressed
+            and not self.emergency_latched
+        ):
+            self.emergency_latched = True
+            self.locked = False
+            suppress = True
+            reason = "emergency"
+        elif (
+            not self.recording
+            and not self.toggle_latched
+            and self.shortcut.matches(self.pressed, event.vk)
+        ):
+            self.toggle_latched = True
+            self.locked = not self.locked
+            suppress = True
+            reason = "toggle"
+        else:
+            suppress = self.locked
+
+        if suppress:
+            self.suppressed_down.add(event.vk)
+        else:
+            self.passed_down.add(event.vk)
+        return Transition(suppress, self.locked, self.locked != previous_locked, reason)
+
+    def _handle_up(self, event: KeyEvent) -> Transition:
+        suppress = self.locked
+        self.pressed.discard(event.vk)
+        self.passed_down.discard(event.vk)
+        self.suppressed_down.discard(event.vk)
+        if event.vk == self.shortcut.trigger_vk:
+            self.toggle_latched = False
+        if event.vk in {VK_LCONTROL, VK_RCONTROL}:
+            self.emergency_latched = False
+        return Transition(suppress, self.locked)
+
+
 def active_modifier_families(pressed: set[int]) -> frozenset[Modifier]:
     return frozenset(family for family, vks in MODIFIER_VKS.items() if pressed & vks)
 
