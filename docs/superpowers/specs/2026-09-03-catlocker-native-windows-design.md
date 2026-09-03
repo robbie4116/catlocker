@@ -71,7 +71,7 @@ Owns the Windows hook adapter:
 - Correct `ctypes` declarations for `KBDLLHOOKSTRUCT`, callback types, pointer-sized return values, and Win32 functions.
 - A strong reference to the callback object for the full hook lifetime.
 - Translation of `WM_KEYDOWN`, `WM_KEYUP`, `WM_SYSKEYDOWN`, and `WM_SYSKEYUP` into pure input events.
-- Private application thread messages for lock, unlock, toggle, shortcut replacement, and shutdown requests.
+- Private application thread messages for lock, unlock, toggle, shortcut replacement, enter/exit recording mode, terminal fail-open, and shutdown requests.
 - `CallNextHookEx` for events the state machine elects to pass.
 
 The hook callback may update only in-memory state and enqueue a lightweight state/error notification. It must not do file I/O, logging, GUI work, network work, sleeps, waits, or blocking cross-thread calls.
@@ -257,7 +257,8 @@ Hotkey editing is disabled while locked. Saving performs:
 3. Ask for explicit confirmation if warnings exist.
 4. Post an in-memory shortcut replacement and receive acknowledgement.
 5. Atomically persist all settings.
-6. If persistence fails, restore the previous in-memory shortcut and show the error.
+6. If persistence succeeds, apply the new live notification preference.
+7. If persistence fails, restore the previous in-memory shortcut, leave the live notification preference unchanged, and show the error.
 
 The replacement acknowledgement includes its command ID and resulting shortcut generation. A late or mismatched acknowledgement is ignored. If replacement or rollback times out, the process fails open and shuts down with the previous TOML still on disk, so no uncertain runtime state remains active.
 
@@ -276,7 +277,7 @@ Whether launched manually, from the Run key, installed, or portable, CatLocker b
 - Hook installation failure: remain unlocked, display a clear error, remove any tray icon, and exit.
 - Tray installation failure: unlock and stop the hook before reporting and exiting.
 - Callback exception: catch it at the `ctypes` boundary, fail open by calling `CallNextHookEx`, mark the state unlocked, and enqueue a fatal error. Never allow a Python exception to escape the callback.
-- Command acknowledgement timeout: retain the prior known state/settings, report the error, and do not persist a speculative change.
+- Command acknowledgement timeout: persisted settings remain unchanged, but runtime state is treated as uncertain; enter terminal fail-open mode, report the error, and shut down.
 - Configuration corruption: preserve the unreadable file for diagnosis and load validated defaults.
 - Startup registry failure: keep the previous checkbox/value state and show the Windows error.
 - Notification failure: ignore it after updating actual lock state; notifications are cosmetic.
@@ -355,6 +356,14 @@ Settings tests cover:
 - Default/partial/corrupt configuration handling.
 - Atomic save and rollback behavior.
 - Correctly quoted startup command construction.
+- Registry read/write failures refreshing from actual state without altering TOML.
+
+Controller and lifecycle tests cover:
+
+- Replacement and rollback acknowledgement timeouts entering terminal fail-open shutdown.
+- Recording-mode entry/exit timeouts entering terminal fail-open shutdown.
+- Poisoned-engine callbacks unconditionally passing subsequent input.
+- Bounded hook/tray shutdown timeouts taking their documented fallback paths.
 
 Windows adapter tests cover structure sizes/signatures and event translation where stable, with the actual system integration verified manually.
 
