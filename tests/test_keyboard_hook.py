@@ -1,6 +1,7 @@
 import ctypes
 import queue
 import threading
+import time
 
 import pytest
 
@@ -10,6 +11,7 @@ from keyboard_hook import (
     EngineEvent,
     HC_ACTION,
     HookStopped,
+    HookTimeout,
     HOOKPROC,
     KBDLLHOOKSTRUCT,
     LLKHF_INJECTED,
@@ -108,6 +110,16 @@ class FakeWin32Api:
         return self.callback(n_code, message, ctypes.addressof(structure))
 
 
+class BlockingGetMessageApi(FakeWin32Api):
+    def __init__(self):
+        super().__init__()
+        self.release_get_message = threading.Event()
+
+    def get_message(self, message=None):
+        self.release_get_message.wait()
+        return super().get_message(message)
+
+
 @pytest.mark.parametrize(
     ("message", "is_keydown"),
     [
@@ -145,6 +157,7 @@ def test_hook_installs_on_own_thread_and_unhooks_on_stop():
     api = FakeWin32Api()
     hook = KeyboardHook(parse_shortcut("F24"), api=api)
     hook.start(timeout=1)
+    assert hook.thread.daemon is True
     assert api.install_calls == 1
     assert hook.thread_id == 42
     hook.stop(timeout=1)
@@ -187,6 +200,55 @@ def test_installation_exception_is_reported_without_start_timeout():
     with pytest.raises(OSError, match="install failed"):
         hook.start(timeout=1)
     assert hook.ready.is_set()
+
+
+@pytest.mark.parametrize("timeout", [None, float("inf"), float("nan")])
+def test_start_rejects_unbounded_or_nonfinite_timeout(timeout):
+    api = FakeWin32Api()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api)
+    try:
+        with pytest.raises(ValueError, match="finite"):
+            hook.start(timeout=timeout)
+    finally:
+        if hook.is_alive():
+            hook.stop(timeout=1)
+
+
+@pytest.mark.parametrize("timeout", [None, float("inf"), float("nan")])
+def test_submit_rejects_unbounded_or_nonfinite_timeout(timeout):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        with pytest.raises(ValueError, match="finite"):
+            hook.submit(CommandKind.SET_LOCKED, True, timeout=timeout)
+    finally:
+        hook.stop(timeout=1)
+
+
+@pytest.mark.parametrize("timeout", [None, float("inf"), float("nan")])
+def test_stop_rejects_unbounded_or_nonfinite_timeout(timeout):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        with pytest.raises(ValueError, match="finite"):
+            hook.stop(timeout=timeout)
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_stop_timeout_is_bounded_and_thread_is_daemon():
+    api = BlockingGetMessageApi()
+    hook = started_hook(api, "F24")
+    started = time.monotonic()
+    try:
+        assert hook.thread.daemon is True
+        with pytest.raises(HookTimeout):
+            hook.stop(timeout=0.01)
+        assert time.monotonic() - started < 0.5
+    finally:
+        api.release_get_message.set()
+        api.messages.put((WM_QUIT, 0, 0))
+        hook.thread.join(timeout=1)
 
 
 def started_hook(api, shortcut):
@@ -362,6 +424,31 @@ class ReplyNoiseApi(FakeWin32Api):
         return True
 
 
+class LateAckApi(FakeWin32Api):
+    def __init__(self):
+        super().__init__()
+        self.hook = None
+        self.late_command_id = None
+        self.late_reply = None
+
+    def post_thread_message(self, thread_id, message, w_param=0, l_param=0):
+        self.post_thread_message_calls.append(
+            (thread_id, message, w_param, l_param)
+        )
+        if message == WM_APP_COMMAND and self.late_command_id is None:
+            self.late_command_id = w_param
+            self.late_reply = self.hook._pending_commands[w_param].reply
+            return True
+        self.messages.put((message, w_param, l_param))
+        return True
+
+    def release_late_acknowledgement(self):
+        self.late_reply.put(
+            CommandResult(self.late_command_id, True, True, 0)
+        )
+        self.messages.put((WM_APP_COMMAND, self.late_command_id, 0))
+
+
 def test_mismatched_command_ids_are_ignored_until_matching_result():
     api = ReplyNoiseApi()
     hook = started_hook(api, "F24")
@@ -371,5 +458,21 @@ def test_mismatched_command_ids_are_ignored_until_matching_result():
         assert result.command_id == 1
         assert result.accepted is True
         assert result.locked is True
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_late_acknowledgement_for_timed_out_command_is_ignored():
+    api = LateAckApi()
+    hook = started_hook(api, "F24")
+    api.hook = hook
+    try:
+        with pytest.raises(HookTimeout):
+            hook.submit(CommandKind.SET_LOCKED, True, timeout=0.01)
+        assert hook._pending_commands == {}
+        api.release_late_acknowledgement()
+        result = hook.submit(CommandKind.SET_LOCKED, False, timeout=1)
+        assert result.accepted is True
+        assert result.locked is False
     finally:
         hook.stop(timeout=1)

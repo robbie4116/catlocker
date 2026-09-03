@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import queue
 import threading
 import time
@@ -66,6 +67,18 @@ class HookStopped(RuntimeError):
 
 class HookTimeout(TimeoutError):
     pass
+
+
+def _require_finite_timeout(timeout: float, operation: str) -> float:
+    try:
+        value = float(timeout)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(
+            f"{operation} timeout must be finite and non-negative."
+        ) from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{operation} timeout must be finite and non-negative.")
+    return value
 
 
 class KBDLLHOOKSTRUCT(ctypes.Structure):
@@ -269,7 +282,8 @@ class KeyboardHook:
     def is_alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
 
-    def start(self, timeout: float | None = 1.0) -> None:
+    def start(self, timeout: float = 1.0) -> None:
+        timeout = _require_finite_timeout(timeout, "start")
         if self.thread is not None:
             raise HookStopped("Keyboard hook has already been started.")
         self.thread = threading.Thread(
@@ -283,7 +297,8 @@ class KeyboardHook:
         if self.installation_exception is not None:
             raise self.installation_exception
 
-    def stop(self, timeout: float | None = 1.0) -> None:
+    def stop(self, timeout: float = 1.0) -> None:
+        timeout = _require_finite_timeout(timeout, "stop")
         thread = self.thread
         if thread is None:
             self.fail_open.set()
@@ -292,21 +307,17 @@ class KeyboardHook:
         if thread is threading.current_thread():
             raise HookStopped("Keyboard hook cannot stop itself.")
 
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = time.monotonic() + timeout
         stop_error: HookStopped | HookTimeout | None = None
         if thread.is_alive() and self.installation_exception is None:
             self.fail_open.set()
-            remaining = (
-                None
-                if deadline is None
-                else max(0.0, deadline - time.monotonic())
-            )
+            remaining = max(0.0, deadline - time.monotonic())
             try:
                 self.submit(CommandKind.STOP, timeout=remaining)
             except (HookStopped, HookTimeout) as exc:
                 stop_error = exc
 
-        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        remaining = max(0.0, deadline - time.monotonic())
         thread.join(remaining)
         if thread.is_alive():
             if stop_error is not None:
@@ -318,8 +329,9 @@ class KeyboardHook:
         kind: CommandKind,
         payload: object = None,
         *,
-        timeout: float | None = 1.0,
+        timeout: float = 1.0,
     ) -> CommandResult:
+        timeout = _require_finite_timeout(timeout, "submit")
         if not isinstance(kind, CommandKind):
             raise ValueError("Unknown keyboard hook command.")
         if self.fail_open.is_set() and kind not in (
@@ -341,14 +353,10 @@ class KeyboardHook:
             self._remove_command(command)
             raise
 
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = time.monotonic() + timeout
         while True:
-            remaining = (
-                None
-                if deadline is None
-                else deadline - time.monotonic()
-            )
-            if remaining is not None and remaining <= 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 self._remove_command(command)
                 raise HookTimeout("Timed out waiting for keyboard hook command.")
             try:
