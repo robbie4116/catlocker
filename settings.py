@@ -1,86 +1,117 @@
+from __future__ import annotations
+
 import os
-import threading
+import tempfile
 import tomllib
-import tomli_w
+from dataclasses import dataclass
+from pathlib import Path
 
-CONFIG_PATH = "keylock.toml"
-
-DEFAULT_CONFIG = {
-    "general": {
-        "unlock": "ctrl+q",
-        "refresh_rate": 1500,
-        "quit_after": "never",
-    },
-    "startup": {
-        "lock_keyboard": False,
-        "lock_mouse": False,
-    },
-}
-
-COMMENTS = """\
-# [general]
-#   unlock       - Shortcut to unlock (examples: ctrl+q, alt+s, shift+ctrl+q)
-#   refresh_rate - Check for lock state every x milliseconds (integer only)
-#   quit_after   - Exit app after some time ("never" or milliseconds as integer, e.g. 5000)
-#
-# [startup]
-#   lock_keyboard - Lock keyboard on launch (true or false)
-#   lock_mouse    - Lock mouse on launch (true or false)
-#
-# NOTE: The "Mouse lock" button is a bit buggy. When you lock only the mouse,
-#       if the exit shortcut contains "ctrl", only a-z characters will work.
-#       This is not an issue when locking only the keyboard or both.
-
-"""
+from hotkeys import ShortcutError, parse_shortcut, validate_shortcut
 
 
-def _write_config(config: dict):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        f.write(COMMENTS)
-        f.write(tomli_w.dumps(config))
+@dataclass(frozen=True, slots=True)
+class AppSettings:
+    toggle_hotkey: str = "F24"
+    notifications: bool = True
 
 
-def open_config() -> dict:
-    """Load config from disk, creating it with defaults if missing or unreadable."""
-    if os.path.exists(CONFIG_PATH):
+def resolve_config_path(executable_dir: Path, local_appdata: Path) -> Path:
+    portable = executable_dir / "catlocker.toml"
+    return portable if portable.is_file() else local_appdata / "CatLocker" / "config.toml"
+
+
+def encode_settings(settings: AppSettings) -> str:
+    hotkey = settings.toggle_hotkey.replace("\\", "\\\\").replace('"', '\\"')
+    notifications = "true" if settings.notifications else "false"
+    return f'toggle_hotkey = "{hotkey}"\nnotifications = {notifications}\n'
+
+
+def _canonicalize_hotkey(raw: str) -> str:
+    if not isinstance(raw, str):
+        raise ShortcutError("A shortcut must be text.")
+    return validate_shortcut(parse_shortcut(raw)).shortcut.canonical
+
+
+def _canonicalize_settings(settings: AppSettings) -> AppSettings:
+    return AppSettings(
+        toggle_hotkey=_canonicalize_hotkey(settings.toggle_hotkey),
+        notifications=settings.notifications,
+    )
+
+
+def _corrupt_backup_path(path: Path) -> Path:
+    candidate = path.with_name(path.name + ".corrupt")
+    number = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.corrupt.{number}")
+        number += 1
+    return candidate
+
+
+def _preserve_corrupt(path: Path) -> None:
+    os.replace(path, _corrupt_backup_path(path))
+
+
+def load_settings(path: Path) -> AppSettings:
+    path = Path(path)
+    if not path.exists():
+        save_settings(path, AppSettings())
+        return AppSettings()
+
+    try:
+        with path.open("rb") as handle:
+            loaded = tomllib.load(handle)
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        _preserve_corrupt(path)
+        save_settings(path, AppSettings())
+        return AppSettings()
+
+    hotkey = AppSettings().toggle_hotkey
+    raw_hotkey = loaded.get("toggle_hotkey") if isinstance(loaded, dict) else None
+    if isinstance(raw_hotkey, str):
         try:
-            with open(CONFIG_PATH, "rb") as f:
-                loaded = tomllib.load(f)
+            hotkey = _canonicalize_hotkey(raw_hotkey)
+        except ShortcutError:
+            pass
 
-            # Merge with defaults so missing keys are always present
-            config = {
-                "general": {**DEFAULT_CONFIG["general"], **loaded.get("general", {})},
-                "startup": {**DEFAULT_CONFIG["startup"], **loaded.get("startup", {})},
-            }
-            return config
-        except Exception as e:
-            print(f"Failed to read config, recreating with defaults: {e}")
+    notifications = AppSettings().notifications
+    raw_notifications = loaded.get("notifications") if isinstance(loaded, dict) else None
+    if isinstance(raw_notifications, bool):
+        notifications = raw_notifications
 
-    _write_config(DEFAULT_CONFIG)
-    return DEFAULT_CONFIG.copy()
+    return AppSettings(toggle_hotkey=hotkey, notifications=notifications)
 
 
-def save_config(
-    unlock: str = None, *, section: str = "general", key: str = None, value=None
-):
-    """
-    Persist a single value to the config file.
+def save_settings(
+    path: Path,
+    settings: AppSettings,
+    *,
+    replace=os.replace,
+    unlink=os.unlink,
+) -> None:
+    path = Path(path)
+    canonical = _canonicalize_settings(settings)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    Convenience shortcuts:
-        save_config("ctrl+q")                         # update unlock shortcut
-        save_config(key="refresh_rate", value=2000)   # update any other key
-    """
-
-    def main():
-        config = open_config()
-
-        if unlock is not None:
-            config["general"]["unlock"] = unlock
-        elif section and key is not None:
-            config.setdefault(section, {})[key] = value
-
-        _write_config(config)
-
-    thread = threading.Thread(target=main, daemon=True)
-    thread.start()
-    thread.join()
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=path.parent,
+            prefix=".catlocker-",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = handle.name
+            handle.write(encode_settings(canonical))
+            handle.flush()
+            os.fsync(handle.fileno())
+        replace(temp_path, path)
+    finally:
+        if temp_path is not None and os.path.exists(temp_path):
+            try:
+                unlink(temp_path)
+            except OSError:
+                pass
