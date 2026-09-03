@@ -69,6 +69,8 @@ TOKEN_TO_NAME = {
     **{name.casefold(): name for name in VK_NAMES},
     **TOKEN_ALIASES,
 }
+VK_TO_NAME = {vk: name for name, vk in VK_NAMES.items()}
+SUPPORTED_MODIFIER_VKS = frozenset().union(*MODIFIER_VKS.values())
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +201,29 @@ class InputState:
 
 def active_modifier_families(pressed: set[int]) -> frozenset[Modifier]:
     return frozenset(family for family, vks in MODIFIER_VKS.items() if pressed & vks)
+
+
+def shortcut_from_pressed_vks(pressed: set[int], *, trigger_vk: int) -> Shortcut:
+    pressed_vks = set(pressed)
+    if trigger_vk in SUPPORTED_MODIFIER_VKS:
+        raise ShortcutError("A modifier cannot be the trigger key.")
+    if trigger_vk not in pressed_vks:
+        raise ShortcutError("The trigger key must be pressed.")
+    try:
+        trigger_name = VK_TO_NAME[trigger_vk]
+    except KeyError as exc:
+        raise ShortcutError(f"Unsupported key: {trigger_vk}") from exc
+
+    extra_non_modifiers = pressed_vks - SUPPORTED_MODIFIER_VKS - {trigger_vk}
+    if extra_non_modifiers:
+        raise ShortcutError("Press exactly one non-modifier trigger key.")
+
+    shortcut = Shortcut(
+        active_modifier_families(pressed_vks),
+        trigger_vk,
+        trigger_name,
+    )
+    return validate_shortcut(shortcut).shortcut
 
 
 @dataclass(frozen=True, slots=True)

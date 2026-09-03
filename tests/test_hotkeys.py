@@ -9,6 +9,7 @@ from hotkeys import (
     VK_LWIN,
     VK_RCONTROL,
     active_modifier_families,
+    shortcut_from_pressed_vks,
     validate_shortcut,
 )
 
@@ -127,3 +128,23 @@ def test_extra_modifier_family_prevents_a_match():
     shortcut = parse_shortcut("ctrl+shift+k")
     assert shortcut.matches({VK_LCONTROL, VK_LSHIFT}, 0x4B)
     assert not shortcut.matches({VK_LCONTROL, VK_LSHIFT, VK_LMENU}, 0x4B)
+
+
+def test_recorded_physical_keys_normalize_to_generic_modifier_families():
+    shortcut = shortcut_from_pressed_vks(
+        {VK_RCONTROL, 0xA1, 0x4B},
+        trigger_vk=0x4B,
+    )
+    assert shortcut.canonical == "Ctrl+Shift+K"
+
+
+def test_recorder_rejects_modifier_only_and_unknown_trigger():
+    with pytest.raises(ShortcutError):
+        shortcut_from_pressed_vks({VK_LCONTROL}, trigger_vk=VK_LCONTROL)
+    with pytest.raises(ShortcutError):
+        shortcut_from_pressed_vks({0xFF}, trigger_vk=0xFF)
+
+
+def test_recorder_rejects_an_extra_non_modifier_key():
+    with pytest.raises(ShortcutError):
+        shortcut_from_pressed_vks({0x41, 0x4B}, trigger_vk=0x4B)
