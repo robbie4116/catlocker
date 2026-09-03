@@ -122,7 +122,7 @@ Owns the small Tk settings UI:
 
 - A hidden Tk root lives on the main thread.
 - The window opens only from the tray.
-- Shortcut recording captures events only while the recorder has focus and Cat Mode is unlocked.
+- Shortcut recording captures events only while the recorder has focus and Cat Mode is unlocked. Entering recording mode first receives acknowledgement from the hook thread that configured-shortcut matching is temporarily suspended; emergency detection and ordinary event propagation remain active.
 - A text field provides a validated fallback.
 - Start-with-Windows and notifications controls.
 - Validation errors, system-shortcut warnings, and persistence failures.
@@ -188,6 +188,8 @@ The state machine tracks:
 
 Repeated keydown messages for a VK already in the down set are autorepeat and cannot activate toggle or emergency transitions again.
 
+The first physical keydown owns the VK's exclusive release disposition until key-up: passed or suppressed, never both. Autorepeat uses a stricter rule. A repeat is passed only when the original keydown was passed and Cat Mode is still unlocked; it is suppressed after a transition to locked. A repeat whose original keydown was suppressed remains suppressed after unlocking so an application never receives repeats without the initial press. The eventual key-up still follows the original keydown disposition.
+
 A custom shortcut matches when its trigger transitions from up to down, every required modifier family is active, and no unconfigured modifier family is active. Holding both sides of one required family still counts as that one family. Unrelated non-modifier keys do not prevent a match, which preserves recovery during chaotic input.
 
 The emergency chord matches only when exact `VK_LCONTROL` and `VK_RCONTROL` are both down and the chord is not latched. It always requests unlocked state and never toggles.
@@ -222,6 +224,8 @@ For `F24`, both press and release are suppressed around either transition.
 
 The state machine does not blindly clear held-key state during a transition. It retains disposition until physical key-up so transitions cannot create unmatched events. A defensive reset is reserved for hook restart or explicit engine reinitialization, neither of which occurs during an ordinary toggle.
 
+Replacing a shortcut while unlocked also preserves existing key dispositions. If the new trigger is already physically down, it starts latched and cannot activate until its physical release. Releasing a held old trigger clears only its existing disposition; it cannot activate either shortcut.
+
 ## Threading and Data Flow
 
 The process uses three event-loop contexts:
@@ -234,6 +238,16 @@ Keyboard transitions occur synchronously on the hook thread so the callback can 
 
 No hook callback waits for another thread. Operations requiring acknowledgement, such as settings replacement or shutdown, originate outside the callback and may wait with a bounded timeout while the hook thread handles the posted message.
 
+Commands that require acknowledgement carry unique IDs. If a shortcut replacement or rollback acknowledgement times out, the application treats the engine as unhealthy, leaves the persisted configuration unchanged, enters fail-open mode, and performs coordinated shutdown. It does not continue running with an uncertain shortcut. State notifications use an unbounded `queue.SimpleQueue`; the callback never waits for a consumer.
+
+The `LLKHF_INJECTED` flag is retained for diagnostics but does not disqualify an event. Injected events, including a Stream Deck-generated F24, use the same matching and suppression path as physical events. CatLocker does not inject replacement keyboard input.
+
+### Recording Mode
+
+The recorder cannot simply rely on Tk while the permanent hook recognizes the same shortcut. Before recording begins, the main thread posts an `ENTER_RECORDING` command and waits for acknowledgement. The command is accepted only while unlocked. In recording mode, the hook temporarily skips configured-toggle matching so the focused Tk control receives the candidate keystrokes normally. Exact emergency recovery detection remains active, and the application remains unlocked.
+
+Cancel, save, recorder focus loss, settings-window close, or any tray lock/toggle request exits recording mode. A lock/toggle request exits recording mode on the hook thread before changing lock state. The settings UI then cancels its partial capture. If entry or exit acknowledgement times out, the application follows the same unhealthy-engine fail-open shutdown path rather than guessing which mode is active.
+
 ## Settings Update Transaction
 
 Hotkey editing is disabled while locked. Saving performs:
@@ -245,7 +259,11 @@ Hotkey editing is disabled while locked. Saving performs:
 5. Atomically persist all settings.
 6. If persistence fails, restore the previous in-memory shortcut and show the error.
 
+The replacement acknowledgement includes its command ID and resulting shortcut generation. A late or mismatched acknowledgement is ignored. If replacement or rollback times out, the process fails open and shuts down with the previous TOML still on disk, so no uncertain runtime state remains active.
+
 Because the hook is permanent and shortcut matching is data-driven, changing the shortcut does not install, remove, or race a second hook.
+
+Start-with-Windows is not duplicated in TOML. Its checkbox reads the actual named Run-key value and applies that registry change as an independent immediate action. On registry failure, the checkbox is refreshed from the actual value and the shortcut/notification configuration is untouched. The TOML transaction therefore covers only the shortcut and notification preference and cannot partially disagree with the Run key.
 
 ## Startup Behavior
 
@@ -265,6 +283,8 @@ Whether launched manually, from the Run key, installed, or portable, CatLocker b
 
 Windows may remove a low-level hook if its callback exceeds the system timeout. The design mitigates this by keeping the callback bounded to in-memory set operations, comparisons, queue insertion, and Win32 return calls.
 
+The first callback exception atomically poisons the engine. A poisoned engine reports unlocked and every current or later callback unconditionally calls `CallNextHookEx` without consulting pressed-key or disposition state. The main-thread lifecycle owner then unhooks and shuts down. This terminal fail-open mode is also available to the main thread if command processing becomes unresponsive.
+
 ## Tray and User Experience
 
 CatLocker starts with no normal window. The notification-area tooltip explicitly says either `CatLocker — Keyboard Unlocked` or `CatLocker — Keyboard Locked`.
@@ -280,11 +300,13 @@ The menu contains:
 
 Lock, Unlock, and Settings enablement reflects the last authoritative state notification. Unlock remains directly available by mouse whenever locked. Separate locked/unlocked icons are desirable if legible assets are available; the tooltip and menu state remain the required unambiguous indicators.
 
+The tray window registers and handles Explorer's `TaskbarCreated` message so it re-adds the icon after the Windows shell restarts.
+
 Optional native tray notifications say `Cat Mode ON — Keyboard Locked` and `Cat Mode OFF — Keyboard Unlocked`.
 
 ## Shutdown
 
-Tray Exit initiates this ordered sequence:
+Tray Exit only enqueues an exit request and returns from the tray window procedure. The Tk/main thread is the lifecycle owner and performs this ordered sequence, so it never asks the tray thread to join itself:
 
 1. Post force-unlock and receive acknowledgement.
 2. Ask the hook thread to remove `WH_KEYBOARD_LL` with `UnhookWindowsHookEx`.
@@ -293,6 +315,8 @@ Tray Exit initiates this ordered sequence:
 5. destroy the Tk root and exit.
 
 Unhooking also restores normal propagation at the operating-system level. The application never intentionally terminates while its hook remains installed and suppressing.
+
+Acknowledgements and thread joins use bounded waits. On hook-thread timeout, the lifecycle owner first sets the shared terminal fail-open flag, then makes a best-effort direct `UnhookWindowsHookEx` call using the retained hook handle and posts `WM_QUIT` again. Tray-thread timeout cannot re-enable suppression because the hook has already been removed; shutdown proceeds after a best-effort `Shell_NotifyIconW(NIM_DELETE)`.
 
 ## Testing Strategy
 
@@ -314,9 +338,14 @@ Pure state-machine tests cover:
 - Autorepeat activating only once per physical press.
 - Release-before-reactivation latching.
 - Passed and suppressed down/up pairing across transitions.
+- Passed keydown, transition to locked, autorepeat suppression, and passed key-up.
+- Suppressed keydown, transition to unlocked, continued autorepeat suppression, and suppressed key-up.
 - Modifiers held before locking and while unlocking.
 - Extra modifier families rejecting configured shortcut matches.
 - Unrelated non-modifier noise not blocking recovery.
+- Shortcut replacement while the old or new trigger is held.
+- Recording mode suspending only configured-toggle matching.
+- Injected F24 following the normal toggle path.
 - Many simultaneous keys, unusual release order, and late key-ups.
 - System keydown/up messages using the same transition path.
 
