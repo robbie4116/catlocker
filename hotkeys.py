@@ -115,19 +115,46 @@ class InputState:
         self.emergency_latched = False
         self.recording = False
 
+    def enter_recording(self) -> bool:
+        if self.locked:
+            return False
+        self.recording = True
+        return True
+
+    def exit_recording(self) -> None:
+        self.recording = False
+
+    def replace_shortcut(self, shortcut: Shortcut) -> bool:
+        if self.locked:
+            return False
+        self.exit_recording()
+        self.shortcut = shortcut
+        self.toggle_latched = shortcut.trigger_vk in self.pressed
+        return True
+
     def set_locked(self, locked: bool) -> Transition:
+        if locked:
+            self.exit_recording()
         changed = self.locked != locked
         self.locked = locked
-        if locked:
-            self.recording = False
         return Transition(False, self.locked, changed, "command" if changed else None)
 
     def handle(self, event: KeyEvent) -> Transition:
         return self._handle_down(event) if event.is_keydown else self._handle_up(event)
 
+    def _repeat_is_suppressed(self, vk: int) -> bool:
+        return vk not in self.passed_down or self.locked
+
+    def _release_is_suppressed(self, vk: int) -> bool:
+        if vk in self.suppressed_down:
+            return True
+        if vk in self.passed_down:
+            return False
+        return self.locked
+
     def _handle_down(self, event: KeyEvent) -> Transition:
         if event.vk in self.pressed:
-            return Transition(self.locked, self.locked)
+            return Transition(self._repeat_is_suppressed(event.vk), self.locked)
 
         self.pressed.add(event.vk)
         previous_locked = self.locked
@@ -159,7 +186,7 @@ class InputState:
         return Transition(suppress, self.locked, self.locked != previous_locked, reason)
 
     def _handle_up(self, event: KeyEvent) -> Transition:
-        suppress = self.locked
+        suppress = self._release_is_suppressed(event.vk)
         self.pressed.discard(event.vk)
         self.passed_down.discard(event.vk)
         self.suppressed_down.discard(event.vk)
