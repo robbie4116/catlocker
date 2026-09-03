@@ -386,6 +386,10 @@ class SettingsWindow:
             if locked:
                 self.window.withdraw()
 
+    def on_startup_state(self, enabled: bool) -> None:
+        self.view.startup_enabled = bool(enabled)
+        self.startup_var.set(self.view.startup_enabled)
+
     def _record(self) -> None:
         try:
             accepted = self.view.begin_recording()

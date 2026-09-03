@@ -309,6 +309,8 @@ class KeyboardHook:
         self.shortcut_generation = 0
 
         self._hook_lock = threading.Lock()
+        self._quit_lock = threading.Lock()
+        self._quit_posted = False
         self._state_lock = threading.Lock()
         self._fail_open_pending = threading.Event()
         self._callback_failure: BaseException | None = None
@@ -434,6 +436,42 @@ class KeyboardHook:
             self._post_command(command)
         except BaseException:
             self._remove_command(command)
+
+    def force_unhook(self) -> None:
+        """Best-effort emergency unhook callable from the lifecycle owner."""
+        self._force_fail_open_unlocked()
+        with self._hook_lock:
+            handle = self.hook_handle
+            if handle is None:
+                return
+            try:
+                unhooked = self.api.unhook(handle)
+                if not unhooked:
+                    raise HookStopped("Win32 unhook did not report success.")
+            except BaseException as exc:
+                self._report_cleanup_error(exc)
+                return
+            if self.hook_handle == handle:
+                self.hook_handle = None
+            self.cleanup_exception = None
+
+    def post_quit(self) -> None:
+        """Best-effort, idempotent emergency quit for the hook owner thread."""
+        self._force_fail_open_unlocked()
+        with self._quit_lock:
+            if self._quit_posted:
+                return
+            thread_id = self.thread_id
+            if thread_id is None:
+                return
+            try:
+                posted = self.api.post_thread_message(thread_id, WM_QUIT, 0, 0)
+                if not posted:
+                    raise HookStopped("Keyboard hook thread stopped accepting quit.")
+            except BaseException as exc:
+                self._report_cleanup_error(exc)
+                return
+            self._quit_posted = True
 
     def _create_command(
         self,
@@ -714,10 +752,14 @@ class KeyboardHook:
             pass
 
     def _post_quit_owner(self) -> None:
-        try:
-            self.api.post_quit(0)
-        except BaseException:
-            pass
+        with self._quit_lock:
+            if self._quit_posted:
+                return
+            try:
+                self.api.post_quit(0)
+            except BaseException:
+                return
+            self._quit_posted = True
 
     def _reject_pending_commands(self) -> None:
         with self._pending_lock:
@@ -849,19 +891,18 @@ class KeyboardHook:
     def _unhook_owner(self) -> bool:
         with self._hook_lock:
             handle = self.hook_handle
-        if handle is None:
-            return True
-        try:
-            unhooked = self.api.unhook(handle)
-        except BaseException as exc:
-            self._report_cleanup_error(exc)
-            return False
-        if not unhooked:
-            self._report_cleanup_error(
-                HookStopped("Win32 unhook did not report success.")
-            )
-            return False
-        with self._hook_lock:
+            if handle is None:
+                return True
+            try:
+                unhooked = self.api.unhook(handle)
+            except BaseException as exc:
+                self._report_cleanup_error(exc)
+                return False
+            if not unhooked:
+                self._report_cleanup_error(
+                    HookStopped("Win32 unhook did not report success.")
+                )
+                return False
             if self.hook_handle == handle:
                 self.hook_handle = None
         self.cleanup_exception = None

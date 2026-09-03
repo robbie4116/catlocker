@@ -349,3 +349,15 @@ def test_notifications_preference_is_observed_on_owner_thread():
     api.wait_until(lambda: tray.state.notifications_enabled is False)
     assert tray.state.notifications_enabled is False
     tray.stop(timeout=1)
+
+
+def test_emergency_force_remove_icon_is_idempotent_and_retains_presentation():
+    api, tray = started_tray()
+
+    tray.force_remove_icon()
+    tray.force_remove_icon()
+
+    assert len(api.delete_calls) == 1
+    tray.post_quit()
+    tray.post_quit()
+    api.wait_until(lambda: not tray.is_alive())

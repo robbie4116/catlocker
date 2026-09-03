@@ -969,6 +969,30 @@ def test_unhook_failure_retains_handle_and_stop_reports_cleanup_error(failure):
     )
 
 
+def test_emergency_force_unhook_is_idempotent_and_fail_open():
+    api = FakeWin32Api()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api)
+    hook.hook_handle = api.hook_handle
+
+    hook.force_unhook()
+    hook.force_unhook()
+
+    assert api.unhooked == [api.hook_handle]
+    assert hook.hook_handle is None
+    assert hook.locked is False
+
+
+def test_emergency_post_quit_is_idempotent():
+    api = FakeWin32Api()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api)
+    hook.thread_id = api.thread_id
+
+    hook.post_quit()
+    hook.post_quit()
+
+    assert [call[1] for call in api.post_thread_message_calls] == [WM_QUIT]
+
+
 class ReplyNoiseApi(FakeWin32Api):
     def __init__(self):
         super().__init__()
