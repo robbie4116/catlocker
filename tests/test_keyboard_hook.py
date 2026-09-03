@@ -194,6 +194,25 @@ class PausingDispatchHook(KeyboardHook):
                 self.dispatch_finished.set()
 
 
+class PausingBeforeCommitHook(KeyboardHook):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.before_commit_started = threading.Event()
+        self.release_before_commit = threading.Event()
+        self.command_finished = threading.Event()
+
+    def _run_command(self, command):
+        if command.kind is CommandKind.SET_LOCKED:
+            self.before_commit_started.set()
+            if not self.release_before_commit.wait(timeout=1):
+                raise AssertionError("test did not release command before commit")
+        try:
+            return super()._run_command(command)
+        finally:
+            if command.kind is CommandKind.SET_LOCKED:
+                self.command_finished.set()
+
+
 @pytest.mark.parametrize(
     ("message", "is_keydown"),
     [
@@ -592,6 +611,53 @@ def test_timed_out_popped_state_changing_command_is_canceled_before_mutation():
         assert hook.locked is False
     finally:
         hook.release_dispatch.set()
+        hook.stop(timeout=1)
+
+
+def test_timed_out_claimed_state_command_is_canceled_before_commit():
+    api = FakeWin32Api()
+    hook = PausingBeforeCommitHook(parse_shortcut("F24"), api=api)
+    hook.start(timeout=1)
+    submit_errors = []
+    submitter_done = threading.Event()
+    submitter = None
+
+    try:
+        assert hook.submit(CommandKind.ENTER_RECORDING, timeout=1).accepted is True
+        initial_state = (
+            hook.state.locked,
+            hook.state.recording,
+            hook.shortcut_generation,
+        )
+
+        def submit_lock_command():
+            try:
+                hook.submit(CommandKind.SET_LOCKED, True, timeout=0.01)
+            except BaseException as exc:
+                submit_errors.append(exc)
+            finally:
+                submitter_done.set()
+
+        submitter = threading.Thread(target=submit_lock_command)
+        submitter.start()
+        assert hook.before_commit_started.wait(timeout=1)
+        assert submitter_done.wait(timeout=0.25), (
+            "timed-out submitter blocked while the command was paused before commit"
+        )
+        assert len(submit_errors) == 1
+        assert isinstance(submit_errors[0], HookTimeout)
+
+        hook.release_before_commit.set()
+        assert hook.command_finished.wait(timeout=1)
+        assert (
+            hook.state.locked,
+            hook.state.recording,
+            hook.shortcut_generation,
+        ) == initial_state
+    finally:
+        hook.release_before_commit.set()
+        if submitter is not None:
+            submitter.join(timeout=1)
         hook.stop(timeout=1)
 
 

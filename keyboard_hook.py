@@ -42,27 +42,30 @@ class _CommandLifecycle:
         self._lock = threading.Lock()
         self._canceled = False
         self._started = False
+        self._commit_started = False
+        self._cancellable = True
 
     def cancel(self) -> bool:
         with self._lock:
-            if self._started:
+            if not self._cancellable or self._commit_started:
                 return False
             self._canceled = True
             return True
 
-    def begin(self) -> bool:
+    def begin(self, *, cancellable: bool = True) -> bool:
         with self._lock:
-            if self._canceled:
+            if self._canceled or self._started:
                 return False
             self._started = True
+            self._cancellable = cancellable
             return True
 
-    def run(self, operation) -> bool:
+    def commit(self, operation):
         with self._lock:
             if self._canceled:
-                return False
-            self._started = True
-            return operation()
+                return False, None
+            self._commit_started = True
+            return True, operation()
 
 
 @dataclass(frozen=True, slots=True)
@@ -544,14 +547,9 @@ class KeyboardHook:
         accepted = False
         stop = command.kind is CommandKind.STOP
         try:
-            if stop:
-                active = command.lifecycle.begin()
-                if active:
-                    accepted = self._run_command(command)
-            else:
-                accepted = command.lifecycle.run(
-                    lambda: self._run_command(command)
-                )
+            active = command.lifecycle.begin(cancellable=not stop)
+            if active:
+                accepted = self._run_command(command)
         except BaseException as exc:
             self._fail_open("command", exc)
             accepted = False
@@ -575,30 +573,51 @@ class KeyboardHook:
             return accepted
         if command.kind is CommandKind.FAIL_OPEN:
             self.fail_open.set()
-            transition = self.state.set_locked(False)
+            committed, transition = command.lifecycle.commit(
+                lambda: self.state.set_locked(False)
+            )
+            if not committed:
+                return False
             if transition.changed:
                 self.events.put(EngineEvent("state", False, "fail_open"))
             return True
         if self.fail_open.is_set():
             return False
         if command.kind is CommandKind.SET_LOCKED:
-            transition = self.state.set_locked(bool(command.payload))
+            committed, transition = command.lifecycle.commit(
+                lambda: self.state.set_locked(bool(command.payload))
+            )
+            if not committed:
+                return False
             self._publish_transition(transition)
             return True
         if command.kind is CommandKind.TOGGLE:
-            transition = self.state.set_locked(not self.state.locked)
+            committed, transition = command.lifecycle.commit(
+                lambda: self.state.set_locked(not self.state.locked)
+            )
+            if not committed:
+                return False
             self._publish_transition(transition)
             return True
         if command.kind is CommandKind.REPLACE_SHORTCUT:
-            accepted = self.state.replace_shortcut(command.payload)
-            if accepted:
-                self.shortcut_generation += 1
+            def replace_shortcut():
+                accepted = self.state.replace_shortcut(command.payload)
+                if accepted:
+                    self.shortcut_generation += 1
+                return accepted
+
+            committed, accepted = command.lifecycle.commit(replace_shortcut)
+            if not committed:
+                return False
             return accepted
         if command.kind is CommandKind.ENTER_RECORDING:
-            return self.state.enter_recording()
+            committed, accepted = command.lifecycle.commit(
+                self.state.enter_recording
+            )
+            return committed and accepted
         if command.kind is CommandKind.EXIT_RECORDING:
-            self.state.exit_recording()
-            return True
+            committed, _ = command.lifecycle.commit(self.state.exit_recording)
+            return committed
         return False
 
     def _publish_transition(self, transition) -> None:
