@@ -3,7 +3,16 @@ from pathlib import Path
 import pytest
 
 from hotkeys import ShortcutError
-from settings import AppSettings, load_settings, resolve_config_path, save_settings
+from settings import (
+    RUN_KEY,
+    STARTUP_VALUE,
+    AppSettings,
+    StartupRegistry,
+    build_startup_command,
+    load_settings,
+    resolve_config_path,
+    save_settings,
+)
 
 
 def test_installed_mode_uses_local_appdata(tmp_path):
@@ -110,3 +119,84 @@ def test_cleanup_failure_does_not_mask_replace_failure(tmp_path):
             replace=fail_replace,
             unlink=fail_unlink,
         )
+
+
+class FakeRegistry:
+    def __init__(self, *, read_error=None, write_error=None, delete_error=None):
+        self.values = {}
+        self.read_error = read_error
+        self.write_error = write_error
+        self.delete_error = delete_error
+
+    def get_value(self, key, name):
+        if self.read_error is not None:
+            raise self.read_error
+        try:
+            return self.values[(key, name)]
+        except KeyError:
+            raise FileNotFoundError(name) from None
+
+    def set_value(self, key, name, value):
+        if self.write_error is not None:
+            raise self.write_error
+        self.values[(key, name)] = value
+
+    def delete_value(self, key, name):
+        if self.delete_error is not None:
+            raise self.delete_error
+        try:
+            del self.values[(key, name)]
+        except KeyError:
+            raise FileNotFoundError(name) from None
+
+
+def test_frozen_startup_command_quotes_executable_path():
+    command = build_startup_command(
+        executable=Path(r"C:\Program Files\CatLocker\catlocker.exe"),
+        script=None,
+    )
+    assert command == '"C:\\Program Files\\CatLocker\\catlocker.exe" --startup'
+
+
+def test_script_startup_command_uses_pythonw_and_quotes_both_paths():
+    command = build_startup_command(
+        executable=Path(r"C:\Program Files\Python\pythonw.exe"),
+        script=Path(r"D:\My Apps\catlocker\main.py"),
+    )
+    assert command == '"C:\\Program Files\\Python\\pythonw.exe" "D:\\My Apps\\catlocker\\main.py" --startup'
+
+
+def test_startup_state_is_derived_from_actual_registry_value():
+    fake = FakeRegistry()
+    startup = StartupRegistry(fake, '"C:\\CatLocker\\catlocker.exe" --startup')
+    assert startup.is_enabled() is False
+    startup.set_enabled(True)
+    assert fake.values[(RUN_KEY, STARTUP_VALUE)] == startup.command
+    assert startup.is_enabled() is True
+    fake.values[(RUN_KEY, STARTUP_VALUE)] = "different command"
+    assert startup.is_enabled() is False
+    startup.set_enabled(False)
+    assert (RUN_KEY, STARTUP_VALUE) not in fake.values
+
+
+def test_registry_failure_does_not_modify_toml(tmp_path):
+    path = tmp_path / "config.toml"
+    save_settings(path, AppSettings("F24", False))
+    original = path.read_bytes()
+    startup = StartupRegistry(FakeRegistry(write_error=PermissionError("denied")), "command")
+    with pytest.raises(PermissionError, match="denied"):
+        startup.set_enabled(True)
+    assert path.read_bytes() == original
+
+
+def test_disabling_missing_startup_value_is_idempotent():
+    startup = StartupRegistry(FakeRegistry(), "command")
+    startup.set_enabled(False)
+    assert startup.is_enabled() is False
+
+
+def test_registry_read_and_delete_errors_propagate():
+    with pytest.raises(PermissionError, match="read denied"):
+        StartupRegistry(FakeRegistry(read_error=PermissionError("read denied")), "command").is_enabled()
+    with pytest.raises(PermissionError, match="delete denied"):
+        StartupRegistry(FakeRegistry(delete_error=PermissionError("delete denied")), "command").set_enabled(False)

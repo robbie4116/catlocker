@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import tomllib
 from dataclasses import dataclass
@@ -9,10 +10,83 @@ from pathlib import Path
 from hotkeys import ShortcutError, parse_shortcut, validate_shortcut
 
 
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+STARTUP_VALUE = "CatLocker"
+
+
 @dataclass(frozen=True, slots=True)
 class AppSettings:
     toggle_hotkey: str = "F24"
     notifications: bool = True
+
+
+def build_startup_command(
+    executable: Path | str,
+    script: Path | str | None = None,
+) -> str:
+    arguments = [str(executable)]
+    if script is not None:
+        arguments.append(str(script))
+    arguments.append("--startup")
+    return subprocess.list2cmdline(arguments)
+
+
+class WindowsRegistryAdapter:
+    def get_value(self, key: str, name: str) -> str:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            key,
+            0,
+            winreg.KEY_READ,
+        ) as handle:
+            value, _ = winreg.QueryValueEx(handle, name)
+            return value
+
+    def set_value(self, key: str, name: str, value: str) -> None:
+        import winreg
+
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            key,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as handle:
+            winreg.SetValueEx(handle, name, 0, winreg.REG_SZ, value)
+
+    def delete_value(self, key: str, name: str) -> None:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            key,
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as handle:
+            winreg.DeleteValue(handle, name)
+
+
+class StartupRegistry:
+    def __init__(self, registry: WindowsRegistryAdapter, command: str):
+        self._registry = registry
+        self.command = command
+
+    def is_enabled(self) -> bool:
+        try:
+            actual_command = self._registry.get_value(RUN_KEY, STARTUP_VALUE)
+        except FileNotFoundError:
+            return False
+        return actual_command == self.command
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled:
+            self._registry.set_value(RUN_KEY, STARTUP_VALUE, self.command)
+            return
+        try:
+            self._registry.delete_value(RUN_KEY, STARTUP_VALUE)
+        except FileNotFoundError:
+            pass
 
 
 def resolve_config_path(executable_dir: Path, local_appdata: Path) -> Path:
