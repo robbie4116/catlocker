@@ -1,6 +1,16 @@
 import pytest
 
-from hotkeys import Modifier, Shortcut, ShortcutError, parse_shortcut
+from hotkeys import Shortcut, ShortcutError, parse_shortcut
+from hotkeys import (
+    Modifier,
+    VK_LCONTROL,
+    VK_LMENU,
+    VK_LSHIFT,
+    VK_LWIN,
+    VK_RCONTROL,
+    active_modifier_families,
+    validate_shortcut,
+)
 
 
 @pytest.mark.parametrize(
@@ -59,3 +69,61 @@ def test_documented_media_and_volume_keys_are_supported(name, vk):
 def test_parse_shortcut_rejects_empty_segments(raw):
     with pytest.raises(ShortcutError, match="empty"):
         parse_shortcut(raw)
+
+
+def test_generic_ctrl_matches_either_or_both_physical_control_keys():
+    assert active_modifier_families({VK_LCONTROL}) == frozenset({Modifier.CTRL})
+    assert active_modifier_families({VK_RCONTROL}) == frozenset({Modifier.CTRL})
+    assert active_modifier_families({VK_LCONTROL, VK_RCONTROL}) == frozenset({Modifier.CTRL})
+
+
+@pytest.mark.parametrize(
+    ("vk", "family"),
+    [
+        (VK_LCONTROL, Modifier.CTRL),
+        (VK_RCONTROL, Modifier.CTRL),
+        (VK_LMENU, Modifier.ALT),
+        (0xA5, Modifier.ALT),
+        (VK_LSHIFT, Modifier.SHIFT),
+        (0xA1, Modifier.SHIFT),
+        (VK_LWIN, Modifier.WIN),
+        (0x5C, Modifier.WIN),
+    ],
+)
+def test_each_physical_modifier_maps_to_its_family(vk, family):
+    assert active_modifier_families({vk}) == frozenset({family})
+
+
+@pytest.mark.parametrize("raw", ["ctrl+alt+delete"])
+def test_secure_sequence_is_rejected(raw):
+    with pytest.raises(ShortcutError, match="secure"):
+        validate_shortcut(parse_shortcut(raw))
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["lctrl+rctrl", "leftctrl+rightctrl", "ctrl_l+ctrl_r"],
+)
+def test_emergency_chord_spellings_cannot_be_configured(raw):
+    with pytest.raises(ShortcutError):
+        parse_shortcut(raw)
+
+
+@pytest.mark.parametrize(
+    ("raw", "warning"),
+    [
+        ("alt+tab", "Windows system shortcut"),
+        ("win+l", "Windows system shortcut"),
+        ("win+r", "Windows system shortcut"),
+        ("win+shift+s", "Windows system shortcut"),
+    ],
+)
+def test_system_shortcuts_require_confirmation(raw, warning):
+    result = validate_shortcut(parse_shortcut(raw))
+    assert any(warning in message for message in result.warnings)
+
+
+def test_extra_modifier_family_prevents_a_match():
+    shortcut = parse_shortcut("ctrl+shift+k")
+    assert shortcut.matches({VK_LCONTROL, VK_LSHIFT}, 0x4B)
+    assert not shortcut.matches({VK_LCONTROL, VK_LSHIFT, VK_LMENU}, 0x4B)

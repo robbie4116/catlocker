@@ -15,6 +15,19 @@ class Modifier(Enum):
     WIN = "Win"
 
 
+VK_LSHIFT, VK_RSHIFT = 0xA0, 0xA1
+VK_LCONTROL, VK_RCONTROL = 0xA2, 0xA3
+VK_LMENU, VK_RMENU = 0xA4, 0xA5
+VK_LWIN, VK_RWIN = 0x5B, 0x5C
+
+MODIFIER_VKS = {
+    Modifier.CTRL: frozenset({VK_LCONTROL, VK_RCONTROL}),
+    Modifier.ALT: frozenset({VK_LMENU, VK_RMENU}),
+    Modifier.SHIFT: frozenset({VK_LSHIFT, VK_RSHIFT}),
+    Modifier.WIN: frozenset({VK_LWIN, VK_RWIN}),
+}
+
+
 MODIFIER_ORDER = (Modifier.CTRL, Modifier.ALT, Modifier.SHIFT, Modifier.WIN)
 MODIFIER_NAMES = {item.value.casefold(): item for item in MODIFIER_ORDER}
 
@@ -68,6 +81,42 @@ class Shortcut:
     def canonical(self) -> str:
         parts = [item.value for item in MODIFIER_ORDER if item in self.modifiers]
         return "+".join([*parts, self.trigger_name])
+
+    def matches(self, pressed: set[int], trigger_vk: int) -> bool:
+        return (
+            trigger_vk == self.trigger_vk
+            and active_modifier_families(pressed) == self.modifiers
+        )
+
+
+def active_modifier_families(pressed: set[int]) -> frozenset[Modifier]:
+    return frozenset(family for family, vks in MODIFIER_VKS.items() if pressed & vks)
+
+
+@dataclass(frozen=True, slots=True)
+class ValidationResult:
+    shortcut: Shortcut
+    warnings: tuple[str, ...] = ()
+
+
+SECURE_SHORTCUTS = {
+    (frozenset({Modifier.CTRL, Modifier.ALT}), 0x2E),
+}
+SYSTEM_SHORTCUTS = {
+    (frozenset({Modifier.ALT}), 0x09),
+    (frozenset({Modifier.WIN}), 0x4C),
+    (frozenset({Modifier.WIN}), 0x52),
+    (frozenset({Modifier.WIN, Modifier.SHIFT}), 0x53),
+}
+SYSTEM_WARNING = "This is a Windows system shortcut and may have surprising behavior."
+
+
+def validate_shortcut(shortcut: Shortcut) -> ValidationResult:
+    signature = (shortcut.modifiers, shortcut.trigger_vk)
+    if signature in SECURE_SHORTCUTS:
+        raise ShortcutError("Windows secure shortcuts cannot be intercepted.")
+    warnings = (SYSTEM_WARNING,) if signature in SYSTEM_SHORTCUTS else ()
+    return ValidationResult(shortcut, warnings)
 
 
 def parse_shortcut(raw: str) -> Shortcut:
