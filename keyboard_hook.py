@@ -6,7 +6,7 @@ import queue
 import threading
 import time
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from hotkeys import InputState, KeyEvent, Shortcut
@@ -37,12 +37,45 @@ class CommandKind(Enum):
     STOP = auto()
 
 
+class _CommandLifecycle:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._canceled = False
+        self._started = False
+
+    def cancel(self) -> bool:
+        with self._lock:
+            if self._started:
+                return False
+            self._canceled = True
+            return True
+
+    def begin(self) -> bool:
+        with self._lock:
+            if self._canceled:
+                return False
+            self._started = True
+            return True
+
+    def run(self, operation) -> bool:
+        with self._lock:
+            if self._canceled:
+                return False
+            self._started = True
+            return operation()
+
+
 @dataclass(frozen=True, slots=True)
 class HookCommand:
     command_id: int
     kind: CommandKind
     payload: object = None
     reply: queue.SimpleQueue | None = None
+    lifecycle: _CommandLifecycle = field(
+        default_factory=_CommandLifecycle,
+        compare=False,
+        repr=False,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,9 +298,12 @@ class KeyboardHook:
         self.hook_handle: HHOOK | int | None = None
         self.callback: HOOKPROC | None = None
         self.installation_exception: BaseException | None = None
+        self.cleanup_exception: BaseException | None = None
         self.shortcut_generation = 0
 
         self._hook_lock = threading.Lock()
+        self._startup_condition = threading.Condition()
+        self._startup_cancelled = threading.Event()
         self._pending_lock = threading.Lock()
         self._pending_commands: dict[int, HookCommand] = {}
         self._next_command_id = 1
@@ -292,8 +328,16 @@ class KeyboardHook:
             daemon=True,
         )
         self.thread.start()
-        if not self.ready.wait(timeout):
-            raise HookTimeout("Timed out starting keyboard hook.")
+        deadline = time.monotonic() + timeout
+        with self._startup_condition:
+            while not self.ready.is_set():
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._startup_cancelled.set()
+                    self.fail_open.set()
+                    self._startup_condition.notify_all()
+                    raise HookTimeout("Timed out starting keyboard hook.")
+                self._startup_condition.wait(remaining)
         if self.installation_exception is not None:
             raise self.installation_exception
 
@@ -303,6 +347,7 @@ class KeyboardHook:
         if thread is None:
             self.fail_open.set()
             self.state.set_locked(False)
+            self._raise_cleanup_error_if_needed()
             return
         if thread is threading.current_thread():
             raise HookStopped("Keyboard hook cannot stop itself.")
@@ -323,6 +368,7 @@ class KeyboardHook:
             if stop_error is not None:
                 raise stop_error
             raise HookTimeout("Timed out stopping keyboard hook.")
+        self._raise_cleanup_error_if_needed()
 
     def submit(
         self,
@@ -357,12 +403,12 @@ class KeyboardHook:
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._remove_command(command)
+                self._cancel_command(command)
                 raise HookTimeout("Timed out waiting for keyboard hook command.")
             try:
                 result = reply.get(timeout=remaining)
             except queue.Empty as exc:
-                self._remove_command(command)
+                self._cancel_command(command)
                 raise HookTimeout("Timed out waiting for keyboard hook command.") from exc
             if getattr(result, "command_id", None) != command.command_id:
                 continue
@@ -400,6 +446,12 @@ class KeyboardHook:
             if self._pending_commands.get(command.command_id) is command:
                 del self._pending_commands[command.command_id]
 
+    def _cancel_command(self, command: HookCommand) -> None:
+        command.lifecycle.cancel()
+        with self._pending_lock:
+            if self._pending_commands.get(command.command_id) is command:
+                del self._pending_commands[command.command_id]
+
     def _post_command(self, command: HookCommand) -> None:
         thread_id = self.thread_id
         if thread_id is None or not self.is_alive():
@@ -428,20 +480,38 @@ class KeyboardHook:
                 else getattr(self.api, "thread_id")
             )
             self.api.initialize_message_queue()
+            if self._startup_cancelled.is_set():
+                return
             self.callback = HOOKPROC(self._callback)
+            if self._startup_cancelled.is_set():
+                return
             handle = self.api.install_hook(self.callback)
-            with self._hook_lock:
-                self.hook_handle = handle
-            self.ready.set()
+            with self._startup_condition:
+                with self._hook_lock:
+                    self.hook_handle = handle
+                if self._startup_cancelled.is_set():
+                    self.fail_open.set()
+                    cancel_install = True
+                else:
+                    self.ready.set()
+                    self._startup_condition.notify_all()
+                    cancel_install = False
+            if cancel_install:
+                return
             self._message_loop()
         except BaseException as exc:
             if not self.ready.is_set():
-                self.installation_exception = exc
-                self.fail_open.set()
+                with self._startup_condition:
+                    self.installation_exception = exc
+                    self.fail_open.set()
+                    self.ready.set()
+                    self._startup_condition.notify_all()
             else:
                 self._fail_open("message_loop", exc)
         finally:
-            self.ready.set()
+            with self._startup_condition:
+                self.ready.set()
+                self._startup_condition.notify_all()
             self._stop_requested.set()
             self.fail_open.set()
             self._force_unlocked()
@@ -474,38 +544,14 @@ class KeyboardHook:
         accepted = False
         stop = command.kind is CommandKind.STOP
         try:
-            if command.kind is CommandKind.STOP:
-                self.fail_open.set()
-                self._force_unlocked()
-                self._stop_requested.set()
-                self._unhook_owner()
-                self._post_quit_owner()
-                accepted = True
-            elif command.kind is CommandKind.FAIL_OPEN:
-                self.fail_open.set()
-                transition = self.state.set_locked(False)
-                if transition.changed:
-                    self.events.put(EngineEvent("state", False, "fail_open"))
-                accepted = True
-            elif self.fail_open.is_set():
-                accepted = False
-            elif command.kind is CommandKind.SET_LOCKED:
-                transition = self.state.set_locked(bool(command.payload))
-                self._publish_transition(transition)
-                accepted = True
-            elif command.kind is CommandKind.TOGGLE:
-                transition = self.state.set_locked(not self.state.locked)
-                self._publish_transition(transition)
-                accepted = True
-            elif command.kind is CommandKind.REPLACE_SHORTCUT:
-                accepted = self.state.replace_shortcut(command.payload)
-                if accepted:
-                    self.shortcut_generation += 1
-            elif command.kind is CommandKind.ENTER_RECORDING:
-                accepted = self.state.enter_recording()
-            elif command.kind is CommandKind.EXIT_RECORDING:
-                self.state.exit_recording()
-                accepted = True
+            if stop:
+                active = command.lifecycle.begin()
+                if active:
+                    accepted = self._run_command(command)
+            else:
+                accepted = command.lifecycle.run(
+                    lambda: self._run_command(command)
+                )
         except BaseException as exc:
             self._fail_open("command", exc)
             accepted = False
@@ -518,8 +564,42 @@ class KeyboardHook:
         )
         if command.reply is not None:
             command.reply.put(result)
-        if stop:
-            return
+
+    def _run_command(self, command: HookCommand) -> bool:
+        if command.kind is CommandKind.STOP:
+            self.fail_open.set()
+            self._force_unlocked()
+            self._stop_requested.set()
+            accepted = self._unhook_owner()
+            self._post_quit_owner()
+            return accepted
+        if command.kind is CommandKind.FAIL_OPEN:
+            self.fail_open.set()
+            transition = self.state.set_locked(False)
+            if transition.changed:
+                self.events.put(EngineEvent("state", False, "fail_open"))
+            return True
+        if self.fail_open.is_set():
+            return False
+        if command.kind is CommandKind.SET_LOCKED:
+            transition = self.state.set_locked(bool(command.payload))
+            self._publish_transition(transition)
+            return True
+        if command.kind is CommandKind.TOGGLE:
+            transition = self.state.set_locked(not self.state.locked)
+            self._publish_transition(transition)
+            return True
+        if command.kind is CommandKind.REPLACE_SHORTCUT:
+            accepted = self.state.replace_shortcut(command.payload)
+            if accepted:
+                self.shortcut_generation += 1
+            return accepted
+        if command.kind is CommandKind.ENTER_RECORDING:
+            return self.state.enter_recording()
+        if command.kind is CommandKind.EXIT_RECORDING:
+            self.state.exit_recording()
+            return True
+        return False
 
     def _publish_transition(self, transition) -> None:
         if transition.changed:
@@ -584,12 +664,35 @@ class KeyboardHook:
             pass
         self.events.put(EngineEvent("fatal", False, reason, error))
 
-    def _unhook_owner(self) -> None:
+    def _raise_cleanup_error_if_needed(self) -> None:
+        error = self.cleanup_exception
+        if error is not None or self.hook_handle is not None:
+            if error is None:
+                error = HookStopped("Keyboard hook cleanup did not complete.")
+            raise HookStopped("Failed to unhook keyboard hook.") from error
+
+    def _report_cleanup_error(self, error: BaseException) -> None:
+        self.cleanup_exception = error
+        self.fail_open.set()
+        self.events.put(EngineEvent("fatal", False, "cleanup", error))
+
+    def _unhook_owner(self) -> bool:
         with self._hook_lock:
             handle = self.hook_handle
-            self.hook_handle = None
-        if handle is not None:
-            try:
-                self.api.unhook(handle)
-            except BaseException:
-                pass
+        if handle is None:
+            return True
+        try:
+            unhooked = self.api.unhook(handle)
+        except BaseException as exc:
+            self._report_cleanup_error(exc)
+            return False
+        if not unhooked:
+            self._report_cleanup_error(
+                HookStopped("Win32 unhook did not report success.")
+            )
+            return False
+        with self._hook_lock:
+            if self.hook_handle == handle:
+                self.hook_handle = None
+        self.cleanup_exception = None
+        return True

@@ -32,11 +32,14 @@ class FakeWin32Api:
     hook_handle = 1234
     call_next_return = 77
 
-    def __init__(self, *, install_error=None):
+    def __init__(self, *, install_error=None, unhook_result=True, unhook_error=None):
         self.install_error = install_error
+        self.unhook_result = unhook_result
+        self.unhook_error = unhook_error
         self.install_calls = 0
         self.call_next_calls = []
         self.unhooked = []
+        self.active_hooks = set()
         self.post_thread_message_calls = []
         self.post_quit_calls = []
         self.install_threads = []
@@ -65,6 +68,7 @@ class FakeWin32Api:
         if self.install_error is not None:
             raise self.install_error
         self.callback = callback
+        self.active_hooks.add(self.hook_handle)
         return self.hook_handle
 
     def call_next(self, hook, n_code, w_param, l_param):
@@ -74,7 +78,11 @@ class FakeWin32Api:
     def unhook(self, hook):
         self.unhook_threads.append(threading.get_ident())
         self.unhooked.append(hook)
-        return True
+        if self.unhook_error is not None:
+            raise self.unhook_error
+        if self.unhook_result:
+            self.active_hooks.discard(hook)
+        return self.unhook_result
 
     def post_thread_message(self, thread_id, message, w_param=0, l_param=0):
         self.post_thread_message_calls.append(
@@ -118,6 +126,72 @@ class BlockingGetMessageApi(FakeWin32Api):
     def get_message(self, message=None):
         self.release_get_message.wait()
         return super().get_message(message)
+
+
+class BlockingInstallApi(FakeWin32Api):
+    def __init__(self):
+        super().__init__()
+        self.install_started = threading.Event()
+        self.release_install = threading.Event()
+        self.install_finished = threading.Event()
+
+    def install_hook(self, callback):
+        self.install_started.set()
+        if not self.release_install.wait(timeout=1):
+            raise AssertionError("test did not release hook installation")
+        try:
+            return super().install_hook(callback)
+        finally:
+            self.install_finished.set()
+
+
+class BlockingUnhookApi(FakeWin32Api):
+    def __init__(self):
+        super().__init__()
+        self.unhook_started = threading.Event()
+        self.release_unhook = threading.Event()
+        self.second_command_posted = threading.Event()
+
+    def unhook(self, hook):
+        self.unhook_started.set()
+        if not self.release_unhook.wait(timeout=1):
+            raise AssertionError("test did not release hook uninstallation")
+        return super().unhook(hook)
+
+    def post_thread_message(self, thread_id, message, w_param=0, l_param=0):
+        posted = super().post_thread_message(thread_id, message, w_param, l_param)
+        if message == WM_APP_COMMAND and len(self.post_thread_message_calls) >= 2:
+            self.second_command_posted.set()
+        return posted
+
+
+class CancellationProbeHook(KeyboardHook):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cancellation_finished = threading.Event()
+
+    def _cancel_command(self, command):
+        super()._cancel_command(command)
+        self.cancellation_finished.set()
+
+
+class PausingDispatchHook(KeyboardHook):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.dispatch_started = threading.Event()
+        self.release_dispatch = threading.Event()
+        self.dispatch_finished = threading.Event()
+
+    def _dispatch_command(self, command):
+        if command.kind is CommandKind.SET_LOCKED:
+            self.dispatch_started.set()
+            if not self.release_dispatch.wait(timeout=1):
+                raise AssertionError("test did not release command dispatch")
+        try:
+            return super()._dispatch_command(command)
+        finally:
+            if command.kind is CommandKind.SET_LOCKED:
+                self.dispatch_finished.set()
 
 
 @pytest.mark.parametrize(
@@ -202,6 +276,48 @@ def test_installation_exception_is_reported_without_start_timeout():
     assert hook.ready.is_set()
 
 
+def test_start_timeout_cancels_delayed_install_before_worker_can_suppress_input():
+    api = BlockingInstallApi()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api)
+    start_errors = []
+
+    def start_hook():
+        try:
+            hook.start(timeout=0.01)
+        except BaseException as exc:
+            start_errors.append(exc)
+
+    starter = threading.Thread(target=start_hook)
+    starter.start()
+    try:
+        assert api.install_started.wait(timeout=1)
+        starter.join(timeout=1)
+        assert not starter.is_alive()
+        assert len(start_errors) == 1
+        assert isinstance(start_errors[0], HookTimeout)
+        assert hook.fail_open.is_set()
+
+        api.release_install.set()
+        assert api.install_finished.wait(timeout=1)
+        api.messages.put((WM_QUIT, 0, 0))
+        hook.thread.join(timeout=1)
+
+        assert not hook.is_alive()
+        assert hook.hook_handle is None
+        assert api.active_hooks == set()
+        assert api.install_threads == api.unhook_threads
+        assert api.emit(
+            HC_ACTION,
+            WM_KEYDOWN,
+            KBDLLHOOKSTRUCT(vkCode=0x87),
+        ) == api.call_next_return
+    finally:
+        api.release_install.set()
+        if hook.thread is not None:
+            api.messages.put((WM_QUIT, 0, 0))
+            hook.thread.join(timeout=1)
+
+
 @pytest.mark.parametrize("timeout", [None, float("inf"), float("nan")])
 def test_start_rejects_unbounded_or_nonfinite_timeout(timeout):
     api = FakeWin32Api()
@@ -249,6 +365,54 @@ def test_stop_timeout_is_bounded_and_thread_is_daemon():
         api.release_get_message.set()
         api.messages.put((WM_QUIT, 0, 0))
         hook.thread.join(timeout=1)
+
+
+def test_stop_does_not_hold_pending_lock_during_blocking_unhook():
+    api = BlockingUnhookApi()
+    hook = CancellationProbeHook(parse_shortcut("F24"), api=api)
+    hook.start(timeout=1)
+    stop_errors = []
+
+    def stop_hook():
+        try:
+            hook.stop(timeout=1)
+        except BaseException as exc:
+            stop_errors.append(exc)
+
+    stopper = threading.Thread(target=stop_hook)
+    stopper.start()
+    submitter = None
+    try:
+        assert api.unhook_started.wait(timeout=1)
+
+        submit_errors = []
+
+        def submit_stop():
+            try:
+                hook.submit(CommandKind.STOP, timeout=0.01)
+            except BaseException as exc:
+                submit_errors.append(exc)
+
+        submitter = threading.Thread(target=submit_stop)
+        submitter.start()
+        assert api.second_command_posted.wait(timeout=1)
+        assert hook.cancellation_finished.wait(timeout=0.5)
+        submitter.join(timeout=1)
+        assert not submitter.is_alive()
+        assert len(submit_errors) == 1
+        assert isinstance(submit_errors[0], HookTimeout)
+    finally:
+        api.release_unhook.set()
+        stopper.join(timeout=1)
+        if submitter is not None:
+            submitter.join(timeout=1)
+        if hook.thread is not None:
+            hook.thread.join(timeout=1)
+
+    assert not stopper.is_alive()
+    assert submitter is None or not submitter.is_alive()
+    assert not hook.is_alive()
+    assert stop_errors == []
 
 
 def started_hook(api, shortcut):
@@ -399,6 +563,63 @@ def test_shortcut_generation_increments_only_for_accepted_replacement():
         assert hook.shortcut_generation == 1
     finally:
         hook.stop(timeout=1)
+
+
+def test_timed_out_popped_state_changing_command_is_canceled_before_mutation():
+    api = FakeWin32Api()
+    hook = PausingDispatchHook(parse_shortcut("F24"), api=api)
+    hook.start(timeout=1)
+    submit_errors = []
+
+    def submit_lock_command():
+        try:
+            hook.submit(CommandKind.SET_LOCKED, True, timeout=0.01)
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    submitter = threading.Thread(target=submit_lock_command)
+    submitter.start()
+    try:
+        assert hook.dispatch_started.wait(timeout=1)
+        submitter.join(timeout=1)
+        assert not submitter.is_alive()
+        assert len(submit_errors) == 1
+        assert isinstance(submit_errors[0], HookTimeout)
+
+        hook.release_dispatch.set()
+        assert hook.dispatch_finished.wait(timeout=1)
+        assert hook.state.locked is False
+        assert hook.locked is False
+    finally:
+        hook.release_dispatch.set()
+        hook.stop(timeout=1)
+
+
+@pytest.mark.parametrize("failure", ["return_false", "raise"])
+def test_unhook_failure_retains_handle_and_stop_reports_cleanup_error(failure):
+    if failure == "return_false":
+        api = FakeWin32Api(unhook_result=False)
+    else:
+        api = FakeWin32Api(unhook_error=OSError("unhook failed"))
+    hook = started_hook(api, "F24")
+
+    with pytest.raises(HookStopped, match="unhook"):
+        hook.stop(timeout=1)
+
+    assert not hook.is_alive()
+    assert hook.fail_open.is_set()
+    assert hook.hook_handle == 1234
+    assert api.active_hooks == {1234}
+    cleanup_events = []
+    while True:
+        try:
+            cleanup_events.append(hook.events.get_nowait())
+        except queue.Empty:
+            break
+    assert any(
+        event.kind == "fatal" and event.reason == "cleanup"
+        for event in cleanup_events
+    )
 
 
 class ReplyNoiseApi(FakeWin32Api):
