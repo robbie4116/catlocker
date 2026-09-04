@@ -1,35 +1,91 @@
-<p align="center">
-    <img src="./assets/icon.png" width="100" height="100"/>
-</p>
+# CatLocker
 
-<h3 align="center">keylock</h3>
+CatLocker is a Windows 11-only tray utility that locks keyboard input while leaving the mouse usable. It is designed to sit in the notification area, always starts unlocked, and recover from the mouse or an exact `Left Ctrl + Right Ctrl` chord.
 
-<p align="center">Lock your keys with ease</p>
+The default setup is `F24`, which makes CatLocker practical with a Stream Deck or any other device that can send `F24`. You can also configure a different shortcut if it fits your workflow better.
 
-## 💠 Preview
+## What it does
 
-<p align="center">
-    <img src="./thumbnail.png" />
-</p>
+- Runs as a tray-first app with no permanent normal window.
+- Uses one transparent `WH_KEYBOARD_LL` low-level keyboard hook.
+- Does not install a mouse hook.
+- Always starts unlocked, including on login startup.
+- Stores local configuration only.
+- Does not include telemetry, network access, or an update checker.
 
-## 🎛️ Config File
+## Recovery paths
 
-You can make a file called `keylock.toml` in the directory where the executable is. It will be used by the app to load the settings. All config options are:
+If CatLocker is locked, you can always recover in one of these ways:
 
+- Press the tray icon and choose `Unlock Keyboard`.
+- Press the exact `Left Ctrl + Right Ctrl` chord.
+- Use the configured keyboard shortcut again if you are intentionally toggling state.
+
+The tray menu also includes `Lock Keyboard` and `Toggle Cat Mode`. When the app is locked, the tray `Unlock Keyboard` command remains available and the Settings window is disabled until the keyboard is unlocked again.
+
+## Shortcuts
+
+CatLocker accepts shortcuts in modifier-plus-trigger form. Examples:
+
+- `F24`
+- `Ctrl+Shift+K`
+- `Ctrl+Alt+F12`
+- `Win+R`
+
+Validation is strict:
+
+- The shortcut must contain exactly one trigger key.
+- Modifier-only combinations are rejected.
+- Duplicate keys are rejected.
+- The exact recovery chord is not configurable as a normal shortcut.
+- Some Windows system shortcuts, such as `Alt+Tab`, `Win+L`, `Win+R`, and `Win+Shift+S`, may show a warning and require explicit confirmation.
+
+`Ctrl+Alt+Delete` is not interceptable by this hook and remains outside CatLocker control. CatLocker also does not claim compatibility with every proprietary HID key or every anti-cheat environment.
+
+## Configuration
+
+CatLocker keeps per-user settings locally.
+
+- Installed mode: `%LOCALAPPDATA%\CatLocker\config.toml`
+- Portable mode: `catlocker.toml` beside the executable, used only when that file already exists
+
+The stored lock state is never persisted. Every launch begins unlocked.
+
+## Limitations
+
+CatLocker is intentionally conservative:
+
+- It does not hide processes or conceal hooks.
+- It does not claim to bypass UIPI, elevated-window restrictions, secure attention paths, proprietary HID drivers, or anti-cheat protections.
+- It does not use driver-level input interception.
+- It does not promise to intercept keys that Windows does not expose through `WH_KEYBOARD_LL`.
+
+Those are platform or policy limits, not features to work around.
+
+## Development
+
+CatLocker targets Python 3.11+ for development, test, and packaging.
+
+Run tests:
+
+```powershell
+py -m pytest -v
 ```
-[general]
-unlock = "ctrl+q"     - Shortcut to unlock (examples: ctrl+q, alt+s, shift+ctrl+q)
-refresh_rate = 1500   - Check for lock state every x milliseconds (integer only)
-quit_after = "never"  - Exit app after some time ("never" or milliseconds as integer, e.g. 5000)
 
-[startup]
-lock_keyboard = false - Lock keyboard on launch (true or false)
-lock_mouse = false    - Lock mouse on launch (true or false)
+Run the Windows build:
+
+```powershell
+py build.py
 ```
 
-> [!Important]
-> The "Mouse lock" button is a bit buggy. When you lock only mouse, if exit shortcut has "ctrl" then you can only use a-z characters and nothing else. This is not an issue when you lock only keyboard or both.
+Build the installer:
 
----
+```powershell
+ISCC.exe catlocker.iss
+```
 
-<p align="center"><a href="https://www.patreon.com/axorax">Support me on Patreon</a> — <a href="https://github.com/axorax/socials">Check out my socials</a></p>
+If `ISCC.exe` is unavailable on the machine, installer verification is pending.
+
+## Credits and license
+
+CatLocker is a fork of Keylock by Axorax. The upstream credit is preserved, and the project remains under the GPL. See [LICENSE](LICENSE).
