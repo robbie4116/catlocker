@@ -11,7 +11,7 @@ Use this checklist to record manual verification on Windows 11. Mark each item a
 - PyInstaller version: 6.15.0
 - Inno Setup version: unavailable (`ISCC.exe` not found)
 - CatLocker build hash: `ad81a25`
-- Executable hash: `E18242EDD183FBD3ACB7C8CC49D8EAD8E145EF20A55FCFCF1245A27E81CA858C`
+- Executable hash: `E77778E94DAAF94E4E24D8088050FA0594901908BC3C49F89FCBB53FBAF72269`
 - Tested machine: local Windows development host
 - Tested input devices: not evaluated; native UI control exposed no targetable Windows applications
 - Stream Deck present: pending
@@ -21,7 +21,7 @@ Use this checklist to record manual verification on Windows 11. Mark each item a
 ## Results
 
 - Overall result: Automated acceptance completed; bounded native smoke test pending.
-- Notes: The fresh pinned environment passed the complete unit suite (261 tests), compileall, both diff checks, and the CatLocker-relevant PyInstaller warning assertion. The rebuilt one-file artifact was launched for the bounded smoke-test window, but the available native UI bridge returned no targetable Windows applications, so no tray or Settings interaction was claimed. The smoke artifact was force-cleaned within the bounded cleanup window and no CatLocker process remained.
+- Notes: The fresh pinned environment passed the complete unit suite (271 tests), compileall, both diff checks, and the CatLocker-relevant PyInstaller warning assertion. The final one-file artifact was not interactively smoke-tested because the available native UI bridge returned no targetable Windows applications; no tray or Settings interaction is claimed. The bounded smoke attempt was force-cleaned and no CatLocker process remained.
 - Pending items: Native tray/Settings smoke interaction, physical Stream Deck/F24 validation, visual tray-state assertions, post-exit keyboard restoration, configured-shortcut/Settings persistence matrix, Explorer restart, startup-at-login, and Inno Setup build.
 
 ## Manual Scenarios
