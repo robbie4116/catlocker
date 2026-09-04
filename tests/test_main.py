@@ -30,7 +30,7 @@ from keyboard_hook import EngineEvent
 from main import AppLifecycle, create_application
 from settings import AppSettings
 from settings_window import StartupUpdateResult
-from tray import TrayAction
+from tray import TrayAction, TrayFatalEvent
 
 
 class FakeRoot:
@@ -185,6 +185,17 @@ class StalledTrayCleanup(FakeTray):
         self.calls.append(("tray_force_remove_icon",))
         self.force_started.set()
         self.release_force.wait(timeout=1)
+
+
+class RuntimeFatalTray(FakeTray):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.events = SimpleQueue()
+        self.runtime_error = RuntimeError("tray runtime failed")
+
+    def start(self, timeout):
+        super().start(timeout)
+        self.events.put(TrayFatalEvent(self.runtime_error))
 
 
 class FakeSettingsWindow:
@@ -540,3 +551,17 @@ def test_fatal_engine_event_fails_open_reports_and_shuts_down():
     assert ("controller_fail_open",) in calls
     assert ("root_show_error", "callback failed") in calls
     assert ("root_destroy",) in calls
+
+
+def test_lifecycle_shuts_down_when_tray_runtime_fails():
+    tray = RuntimeFatalTray([])
+    app, calls = make_app(tray=tray)
+    app.start()
+    app.pump_events()
+
+    assert app.closing is True
+    assert app.running is False
+    assert ("controller_fail_open",) in calls
+    assert ("hook_stop",) in calls
+    assert ("root_destroy",) in calls
+    assert ("root_show_error", "tray runtime failed") in calls

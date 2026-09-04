@@ -227,6 +227,11 @@ class TrayStopped(RuntimeError):
     pass
 
 
+@dataclass(frozen=True, slots=True)
+class TrayFatalEvent:
+    error: BaseException
+
+
 class TrayTimeout(TimeoutError):
     pass
 
@@ -572,8 +577,15 @@ class NativeTray:
         self.cleanup_exception: BaseException | None = None
 
         self._updates: SimpleQueue[TrayUpdate] = SimpleQueue()
+        self.events: SimpleQueue[TrayFatalEvent] = SimpleQueue()
         self._startup_condition = threading.Condition()
         self._startup_cancelled = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._started = False
+        self._unexpected_stop = False
+        self._fatal_error: BaseException | None = None
+        self._intentional_stop = False
+        self._fatal_published = False
         self._presentation_lock = threading.Lock()
         self._icon_cleanup_state = "available"
         self._icon_cleanup_token = None
@@ -591,6 +603,7 @@ class NativeTray:
         timeout = _require_finite_timeout(timeout, "start")
         if self.thread is not None:
             raise TrayStopped("Native tray has already been started.")
+        self._started = True
         self.thread = threading.Thread(
             target=self._run,
             name="CatLockerNativeTray",
@@ -617,6 +630,7 @@ class NativeTray:
         if thread is threading.current_thread():
             raise TrayStopped("Native tray cannot stop itself.")
 
+        self._intentional_stop = True
         deadline = time.monotonic() + timeout
         if self.window_handle is None:
             self._startup_cancelled.set()
@@ -645,7 +659,17 @@ class NativeTray:
     def post_update(self, update: TrayUpdate) -> None:
         if not isinstance(update, TrayUpdate):
             raise TypeError("Native tray updates must be TrayUpdate values.")
-        self._updates.put(update)
+        with self._lifecycle_lock:
+            thread = self.thread
+            if self._unexpected_stop or (
+                self._started and thread is not None and not thread.is_alive()
+            ):
+                cause = self._fatal_error
+                error = TrayStopped("Native tray stopped unexpectedly.")
+                if cause is not None:
+                    raise error from cause
+                raise error
+            self._updates.put(update)
         window_handle = self.window_handle
         if self.is_alive() and window_handle is not None:
             try:
@@ -712,6 +736,7 @@ class NativeTray:
 
     def post_quit(self) -> None:
         """Best-effort, idempotent emergency quit for the tray owner thread."""
+        self._intentional_stop = True
         with self._quit_lock:
             if self._quit_posted:
                 return
@@ -745,6 +770,15 @@ class NativeTray:
                 self.api.message_loop(self.window_proc)
             except BaseException as exc:
                 self.message_loop_exception = exc
+                if not self._intentional_stop:
+                    self._publish_fatal(exc)
+            else:
+                if not self._intentional_stop:
+                    self._publish_fatal(
+                        TrayStopped(
+                            "Native tray message loop returned unexpectedly."
+                        )
+                    )
         except BaseException as exc:
             self.installation_exception = exc
         finally:
@@ -755,6 +789,19 @@ class NativeTray:
             self._cleanup_owner()
             if not self.ready.is_set():
                 self._signal_ready(success=False)
+
+    def _publish_fatal(self, error: BaseException) -> None:
+        with self._lifecycle_lock:
+            if self._fatal_published:
+                return
+            self._fatal_published = True
+            self._unexpected_stop = True
+            self._fatal_error = error
+        self.events.put(TrayFatalEvent(error))
+        try:
+            self.api.quit_message()
+        except BaseException:
+            pass
 
     def _initialize_owner(self) -> None:
         self.icon_handle = self.api.load_icon(self.icon_path)
@@ -882,6 +929,25 @@ class NativeTray:
             return
 
     def _window_proc(
+        self,
+        window_handle: wintypes.HWND,
+        message: int,
+        wparam: int,
+        lparam: int,
+    ) -> int:
+        try:
+            return self._window_proc_body(
+                window_handle,
+                message,
+                wparam,
+                lparam,
+            )
+        except BaseException as exc:
+            if not self._intentional_stop:
+                self._publish_fatal(exc)
+            return 0
+
+    def _window_proc_body(
         self,
         window_handle: wintypes.HWND,
         message: int,

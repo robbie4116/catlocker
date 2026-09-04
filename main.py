@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from controller import EngineUnhealthy
+
 
 refresh_rate = 1500
 PUMP_INTERVAL_MS = 25
@@ -107,6 +109,7 @@ class AppLifecycle:
         self._main_thread_id = threading.get_ident()
         self._running = False
         self._closing = False
+        self._fatal_handled = False
         self._root_destroyed = False
         self._pump_scheduled = False
         state = getattr(tray, "state", None)
@@ -265,15 +268,23 @@ class AppLifecycle:
 
             if not isinstance(error, EngineUnhealthy):
                 raise
-            self._enter_fail_open()
-            self._report_error(error)
-            self.shutdown()
+            self._handle_fatal(error)
 
     def pump_events(self) -> None:
         if not self._running or self._closing:
             return
 
-        from tray import TrayUpdate
+        from tray import TrayStopped, TrayUpdate
+
+        tray_events = getattr(self.tray, "events", None)
+        if tray_events is not None:
+            while True:
+                try:
+                    tray_event = tray_events.get_nowait()
+                except queue.Empty:
+                    break
+                self._handle_fatal(tray_event.error)
+                return
 
         events = getattr(self.controller, "events", self.hook.events)
         while True:
@@ -281,20 +292,22 @@ class AppLifecycle:
                 event = events.get_nowait()
             except queue.Empty:
                 break
-            self.tray.post_update(
-                TrayUpdate(
-                    locked=bool(event.locked),
-                    reason=event.reason,
+            try:
+                self.tray.post_update(
+                    TrayUpdate(
+                        locked=bool(event.locked),
+                        reason=event.reason,
+                    )
                 )
-            )
-            self.settings_window.on_lock_state(bool(event.locked))
+                self.settings_window.on_lock_state(bool(event.locked))
+            except (TrayStopped, EngineUnhealthy) as error:
+                self._handle_fatal(error)
+                return
             if event.kind == "fatal":
                 error = event.error or RuntimeError(
                     event.reason or "Keyboard engine failed."
                 )
-                self._enter_fail_open()
-                self._report_error(error)
-                self.shutdown()
+                self._handle_fatal(error)
                 return
 
         while True:
@@ -347,6 +360,14 @@ class AppLifecycle:
                 enter_fail_open()
             except BaseException as error:
                 self._report_error(error)
+
+    def _handle_fatal(self, error: BaseException) -> None:
+        if self._fatal_handled:
+            return
+        self._fatal_handled = True
+        self._enter_fail_open()
+        self._report_error(error)
+        self.shutdown()
 
     def _report_error(self, error: BaseException) -> None:
         try:

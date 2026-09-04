@@ -1,4 +1,5 @@
 from pathlib import Path
+import queue
 from queue import Queue, SimpleQueue
 from types import SimpleNamespace
 import threading
@@ -10,6 +11,8 @@ from tray import (
     MenuCommand,
     NativeTray,
     TrayAction,
+    TrayFatalEvent,
+    TrayStopped,
     TrayState,
     TrayUpdate,
     build_menu_state,
@@ -57,6 +60,7 @@ class FakeTrayApi:
         set_version_error=None,
         notification_error=None,
         message_loop_error=None,
+        unexpected_clean_return=False,
         delete_error=None,
     ):
         self.load_error = load_error
@@ -66,6 +70,7 @@ class FakeTrayApi:
         self.set_version_error = set_version_error
         self.notification_error = notification_error
         self.message_loop_error = message_loop_error
+        self.unexpected_clean_return = unexpected_clean_return
         self.delete_error = delete_error
         self.icon_handle = 0x1001
         self.window_handle = 0x2001
@@ -78,6 +83,7 @@ class FakeTrayApi:
         self.add_calls = []
         self.set_version_calls = []
         self.modify_calls = []
+        self.modify_error = None
         self.delete_calls = []
         self.add_threads = []
         self.modify_threads = []
@@ -145,6 +151,8 @@ class FakeTrayApi:
         self._record("modify_icon")
         self.modify_threads.append(threading.get_ident())
         self.modify_calls.append(SimpleNamespace(tooltip=self._tooltip(data)))
+        if self.modify_error is not None:
+            raise self.modify_error
         return True
 
     def delete_icon(self, data):
@@ -185,6 +193,8 @@ class FakeTrayApi:
         self.loop_started.set()
         if self.message_loop_error is not None:
             raise self.message_loop_error
+        if self.unexpected_clean_return:
+            return
         while not self._quit.is_set():
             try:
                 message, wparam, lparam = self._messages.get(timeout=0.05)
@@ -407,3 +417,79 @@ def test_later_lock_update_replaces_earlier_custom_tooltip():
         assert tray.state.tooltip == "CatLocker — Keyboard Locked"
     finally:
         tray.stop(timeout=1)
+
+
+def test_unexpected_clean_message_loop_return_publishes_fatal_event():
+    api = FakeTrayApi(unexpected_clean_return=True)
+    tray = NativeTray(
+        actions=SimpleQueue(),
+        startup_enabled=False,
+        notifications=True,
+        icon_path=Path("assets/icon.ico"),
+        api=api,
+    )
+    tray.start(timeout=1)
+    api.wait_until(lambda: not tray.is_alive())
+
+    event = tray.events.get_nowait()
+    assert isinstance(event, TrayFatalEvent)
+    assert isinstance(event.error, TrayStopped)
+
+
+def test_message_loop_exception_publishes_fatal_event():
+    error = OSError("message loop failed")
+    api = FakeTrayApi(message_loop_error=error)
+    tray = NativeTray(
+        actions=SimpleQueue(),
+        startup_enabled=False,
+        notifications=True,
+        icon_path=Path("assets/icon.ico"),
+        api=api,
+    )
+    tray.start(timeout=1)
+    api.wait_until(lambda: not tray.is_alive())
+
+    event = tray.events.get_nowait()
+    assert isinstance(event, TrayFatalEvent)
+    assert event.error is error
+
+
+def test_window_proc_taskbar_restore_failure_publishes_fatal_event():
+    api, tray = started_tray()
+    api.add_error = OSError("restore failed")
+    api.emit_taskbar_created()
+    api.wait_until(lambda: not tray.is_alive())
+
+    event = tray.events.get_nowait()
+    assert isinstance(event.error, OSError)
+    assert str(event.error) == "restore failed"
+
+
+def test_window_proc_modify_failure_publishes_fatal_event():
+    api, tray = started_tray()
+    api.modify_error = OSError("modify failed")
+    tray.post_update(TrayUpdate(locked=True))
+    api.wait_until(lambda: not tray.is_alive())
+
+    event = tray.events.get_nowait()
+    assert isinstance(event.error, OSError)
+    assert str(event.error) == "modify failed"
+
+
+def test_post_update_rejects_an_unexpectedly_dead_tray_before_enqueue():
+    api = FakeTrayApi(message_loop_error=OSError("dead tray"))
+    tray = NativeTray(
+        actions=SimpleQueue(),
+        startup_enabled=False,
+        notifications=True,
+        icon_path=Path("assets/icon.ico"),
+        api=api,
+    )
+    tray.start(timeout=1)
+    api.wait_until(lambda: not tray.is_alive())
+
+    with pytest.raises(TrayStopped) as caught:
+        tray.post_update(TrayUpdate(locked=True))
+    assert str(caught.value.__cause__) == "dead tray"
+    with pytest.raises(queue.Empty):
+        tray._updates.get_nowait()
