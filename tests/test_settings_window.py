@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+from types import ModuleType
+
 import pytest
 
 from controller import EngineUnhealthy
@@ -300,6 +303,113 @@ class FakeTkEvent:
         self.keysym = keysym
 
 
+class FakeTkWidget:
+    def __init__(self, *args, **kwargs):
+        self.configured = {}
+        self.bindings = {}
+        self._next_binding = 1
+
+    def pack(self, *args, **kwargs):
+        return None
+
+    def place(self, *args, **kwargs):
+        return None
+
+    def configure(self, **kwargs):
+        self.configured.update(kwargs)
+
+    config = configure
+
+    def bind(self, sequence, callback):
+        binding_id = f"binding-{self._next_binding}"
+        self._next_binding += 1
+        self.bindings[(sequence, binding_id)] = callback
+        return binding_id
+
+    def unbind(self, sequence, binding_id=None):
+        if binding_id is None:
+            self.bindings = {
+                key: value
+                for key, value in self.bindings.items()
+                if key[0] != sequence
+            }
+        else:
+            self.bindings.pop((sequence, binding_id), None)
+
+    def focus_set(self):
+        return None
+
+
+class FakeTkVariable:
+    def __init__(self, master=None, value=None):
+        self.value = value
+
+    def get(self):
+        return self.value
+
+    def set(self, value):
+        self.value = value
+
+
+class FakeTkToplevel(FakeTkWidget):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.protocols = {}
+        self.withdrawn = False
+        self.destroyed = False
+        self.deiconify_count = 0
+
+    def title(self, value):
+        self.window_title = value
+
+    def withdraw(self):
+        self.withdrawn = True
+
+    def deiconify(self):
+        self.withdrawn = False
+        self.deiconify_count += 1
+
+    def lift(self):
+        return None
+
+    def protocol(self, name, callback):
+        self.protocols[name] = callback
+
+    def destroy(self):
+        self.destroyed = True
+
+
+def fake_tk_module():
+    tk = ModuleType("tkinter")
+    tk.Toplevel = FakeTkToplevel
+    tk.Frame = FakeTkWidget
+    tk.Label = FakeTkWidget
+    tk.Entry = FakeTkWidget
+    tk.Button = FakeTkWidget
+    tk.Checkbutton = FakeTkWidget
+    tk.StringVar = FakeTkVariable
+    tk.BooleanVar = FakeTkVariable
+    messagebox = ModuleType("tkinter.messagebox")
+    messagebox.askyesno = lambda *args, **kwargs: True
+    messagebox.showerror = lambda *args, **kwargs: None
+    tk.messagebox = messagebox
+    return tk, messagebox
+
+
+def make_settings_window(monkeypatch, *, on_engine_unhealthy=None):
+    import settings_window as settings_window_module
+
+    tk, messagebox = fake_tk_module()
+    monkeypatch.setitem(sys.modules, "tkinter", tk)
+    monkeypatch.setitem(sys.modules, "tkinter.messagebox", messagebox)
+    coordinator = make_coordinator([])
+    return settings_window_module.SettingsWindow(
+        object(),
+        coordinator,
+        on_engine_unhealthy=on_engine_unhealthy,
+    )
+
+
 def test_view_record_display_changes_only_after_coordinator_acceptance():
     rejected = make_coordinator(
         [],
@@ -379,3 +489,79 @@ def test_view_startup_error_refreshes_checkbox_from_actual_registry_state():
         view.set_startup_enabled(False)
 
     assert view.startup_enabled is True
+
+
+def test_settings_window_installs_permanent_close_protocol(monkeypatch):
+    window = make_settings_window(monkeypatch)
+
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+
+
+def test_settings_window_is_reusable_after_cancel_and_titlebar_close(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window.show()
+    window.hotkey_var.set("K")
+    window._close()
+    assert window.window.destroyed is False
+    assert window.window.withdrawn is True
+
+    window.show()
+    assert window.hotkey_var.get() == "F24"
+    window.window.protocols["WM_DELETE_WINDOW"]()
+    assert window.window.destroyed is False
+    assert window.window.withdrawn is True
+
+    window.show()
+    assert window.hotkey_var.get() == "F24"
+    assert window.window.deiconify_count == 3
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        "record",
+        "save",
+        "key_press",
+        "focus_out",
+        "close",
+        "lock_state",
+    ],
+)
+def test_engine_unhealthy_routes_every_settings_handler_to_fatal_shutdown(
+    monkeypatch,
+    handler,
+):
+    fatal_errors = []
+    window = make_settings_window(
+        monkeypatch,
+        on_engine_unhealthy=fatal_errors.append,
+    )
+    error = EngineUnhealthy(f"{handler} failed")
+    view_method = {
+        "record": "begin_recording",
+        "save": "save",
+        "key_press": "on_key_press",
+        "focus_out": "on_focus_out",
+        "close": "on_close",
+        "lock_state": "on_lock_state",
+    }[handler]
+    monkeypatch.setattr(
+        window.view,
+        view_method,
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
+    )
+
+    if handler == "record":
+        window._record()
+    elif handler == "save":
+        window._save()
+    elif handler == "key_press":
+        window._on_key_press(FakeTkEvent(0x4B))
+    elif handler == "focus_out":
+        window._on_focus_out()
+    elif handler == "close":
+        window._close()
+    else:
+        window.on_lock_state(True)
+
+    assert fatal_errors == [error]

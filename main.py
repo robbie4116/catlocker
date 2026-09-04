@@ -333,10 +333,17 @@ class AppLifecycle:
     def _handle_startup_action(self) -> None:
         requested = not self._startup_enabled
         result = self.coordinator.set_startup_enabled(requested)
+        self.apply_startup_result(result)
+
+    def apply_startup_result(self, result) -> None:
         if result.enabled is not None:
             self._startup_enabled = bool(result.enabled)
-            self._post_startup_state(self._startup_enabled)
-            self.settings_window.on_startup_state(self._startup_enabled)
+            try:
+                self._post_startup_state(self._startup_enabled)
+                self.settings_window.on_startup_state(self._startup_enabled)
+            except (EngineUnhealthy, Exception) as error:
+                self._handle_fatal(error)
+                return
         if result.error is not None:
             self._report_error(result.error)
 
@@ -491,12 +498,6 @@ def create_application(
             startup_registry,
             tray.post_notifications_enabled,
         )
-        settings_window = _factory(
-            bundle,
-            "settings_window",
-            SettingsWindow,
-        )(root, coordinator, startup_enabled=startup_enabled)
-
         default_show_error = lambda error: _show_tk_error(root, error)
         show_error_factory = _factory(bundle, "show_error", None)
         if show_error_factory is None:
@@ -504,7 +505,34 @@ def create_application(
         else:
             show_error = lambda error: show_error_factory(root, error)
 
-        return AppLifecycle(
+        lifecycle_ref: dict[str, AppLifecycle] = {}
+
+        def on_engine_unhealthy(error: EngineUnhealthy) -> None:
+            lifecycle = lifecycle_ref.get("app")
+            if lifecycle is None:
+                show_error(error)
+                return
+            lifecycle._handle_fatal(error)
+
+        def on_startup_result(result) -> None:
+            lifecycle = lifecycle_ref.get("app")
+            if lifecycle is None:
+                return
+            lifecycle.apply_startup_result(result)
+
+        settings_window = _factory(
+            bundle,
+            "settings_window",
+            SettingsWindow,
+        )(
+            root,
+            coordinator,
+            startup_enabled=startup_enabled,
+            on_engine_unhealthy=on_engine_unhealthy,
+            on_startup_result=on_startup_result,
+        )
+
+        lifecycle = AppLifecycle(
             root=root,
             hook=hook,
             controller=controller,
@@ -517,6 +545,8 @@ def create_application(
             thread_timeout=thread_timeout,
             startup_registry=startup_registry,
         )
+        lifecycle_ref["app"] = lifecycle
+        return lifecycle
     except BaseException:
         try:
             root.destroy()

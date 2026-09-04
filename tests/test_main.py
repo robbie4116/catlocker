@@ -265,7 +265,14 @@ class RecordingFactories:
         self.coordinator_settings = current
         return FakeCoordinator(self.calls)
 
-    def create_settings_window(self, root, coordinator, startup_enabled):
+    def create_settings_window(
+        self,
+        root,
+        coordinator,
+        startup_enabled,
+        on_engine_unhealthy=None,
+        on_startup_result=None,
+    ):
         return FakeSettingsWindow(self.calls)
 
     def show_error(self, root, error):

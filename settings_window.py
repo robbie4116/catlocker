@@ -257,6 +257,8 @@ class SettingsViewModel:
 
     def on_close(self) -> None:
         self.cancel_recording()
+        self.hotkey_text = self._accepted_hotkey
+        self.notifications = self.coordinator.current.notifications
 
     def save(
         self,
@@ -304,6 +306,8 @@ class SettingsWindow:
         *,
         startup_enabled: bool = False,
         view_model: SettingsViewModel | None = None,
+        on_engine_unhealthy: Callable[[EngineUnhealthy], object] | None = None,
+        on_startup_result: Callable[[StartupUpdateResult], object] | None = None,
     ) -> None:
         import tkinter as tk
         from tkinter import messagebox
@@ -311,6 +315,8 @@ class SettingsWindow:
         self.root = root
         self._tk = tk
         self._messagebox = messagebox
+        self._on_engine_unhealthy = on_engine_unhealthy
+        self._on_startup_result = on_startup_result
         self.view = view_model or SettingsViewModel(
             coordinator,
             startup_enabled=startup_enabled,
@@ -318,6 +324,7 @@ class SettingsWindow:
         self.window = tk.Toplevel(root)
         self.window.title("CatLocker Settings")
         self.window.withdraw()
+        self.window.protocol("WM_DELETE_WINDOW", self._close)
 
         self.hotkey_var = tk.StringVar(self.window, value=self.view.hotkey_text)
         self.notifications_var = tk.BooleanVar(
@@ -379,7 +386,10 @@ class SettingsWindow:
 
     def on_lock_state(self, locked: bool) -> None:
         try:
-            self.view.on_lock_state(locked)
+            try:
+                self.view.on_lock_state(locked)
+            except EngineUnhealthy as exc:
+                self._handle_engine_unhealthy(exc)
         finally:
             self._unbind_recording_events()
             self._sync_controls()
@@ -394,7 +404,7 @@ class SettingsWindow:
         try:
             accepted = self.view.begin_recording()
         except EngineUnhealthy as exc:
-            self._show_error(exc)
+            self._handle_engine_unhealthy(exc)
             return
         if accepted:
             self._bind_recording_events()
@@ -417,6 +427,10 @@ class SettingsWindow:
         except WarningDeclined:
             self.hotkey_var.set(self.view.hotkey_text)
             return
+        except EngineUnhealthy as exc:
+            self.hotkey_var.set(self.view.hotkey_text)
+            self._handle_engine_unhealthy(exc)
+            return
         except Exception as exc:
             self.hotkey_var.set(self.view.hotkey_text)
             self._show_error(exc)
@@ -437,16 +451,16 @@ class SettingsWindow:
         try:
             self.view.on_close()
         except EngineUnhealthy as exc:
-            self._show_error(exc)
+            self._handle_engine_unhealthy(exc)
             return
         self._unbind_recording_events()
-        self.window.destroy()
+        self.window.withdraw()
 
     def _on_key_press(self, event) -> str:
         try:
             shortcut = self.view.on_key_press(event)
         except EngineUnhealthy as exc:
-            self._show_error(exc)
+            self._handle_engine_unhealthy(exc)
             self._unbind_recording_events()
             self._sync_controls()
             return
@@ -464,7 +478,7 @@ class SettingsWindow:
         try:
             self.view.on_focus_out()
         except EngineUnhealthy as exc:
-            self._show_error(exc)
+            self._handle_engine_unhealthy(exc)
         finally:
             self._unbind_recording_events()
             self._sync_controls()
@@ -493,7 +507,12 @@ class SettingsWindow:
         for widget, sequence, binding_id in self._recording_bindings:
             widget.unbind(sequence, binding_id)
         self._recording_bindings.clear()
-        self.window.protocol("WM_DELETE_WINDOW", "")
+
+    def _handle_engine_unhealthy(self, error: EngineUnhealthy) -> None:
+        if self._on_engine_unhealthy is not None:
+            self._on_engine_unhealthy(error)
+            return
+        self._show_error(error)
 
     def _sync_controls(self) -> None:
         self.record_button.configure(
