@@ -10,28 +10,28 @@ Use this checklist to record manual verification on Windows 11. Mark each item a
 - Python version: 3.13.1
 - PyInstaller version: 6.15.0
 - Inno Setup version: unavailable (`ISCC.exe` not found)
-- CatLocker build hash: `1307cf0`
-- Executable hash: `B17F99A060EDF3F705730374003D551AC95135F1983E94B9E6D21B5381FA51F3`
+- CatLocker build hash: `ad81a25`
+- Executable hash: `E18242EDD183FBD3ACB7C8CC49D8EAD8E145EF20A55FCFCF1245A27E81CA858C`
 - Tested machine: local Windows development host
-- Tested input devices: built-in keyboard path; User32 equivalent F24 sender
+- Tested input devices: not evaluated; native UI control exposed no targetable Windows applications
 - Stream Deck present: pending
 - Physical F24 sender present: no
 - `ISCC.exe` present: no
 
 ## Results
 
-- Overall result: Partial acceptance completed; native startup, equivalent keyboard delivery, tray mouse interaction, and graceful cleanup passed.
-- Notes: The packaged one-file executable started responsive with no main window. Equivalent F24 toggle, repeated/held F24, exact Left Ctrl + Right Ctrl recovery, and a locked-path tray Exit sequence were delivered. Tray owner HWND and both one-file processes were gone after Exit. The computer-use UI bridge was unavailable, so visual tray/tooltip/menu assertions were not observable.
-- Pending items: Physical Stream Deck/F24 validation, visual tray-state assertions, post-exit keyboard restoration, configured-shortcut/Settings persistence matrix, Explorer restart, startup-at-login, and Inno Setup build.
+- Overall result: Automated acceptance completed; bounded native smoke test pending.
+- Notes: The fresh pinned environment passed the complete unit suite (261 tests), compileall, both diff checks, and the CatLocker-relevant PyInstaller warning assertion. The rebuilt one-file artifact was launched for the bounded smoke-test window, but the available native UI bridge returned no targetable Windows applications, so no tray or Settings interaction was claimed. The smoke artifact was force-cleaned within the bounded cleanup window and no CatLocker process remained.
+- Pending items: Native tray/Settings smoke interaction, physical Stream Deck/F24 validation, visual tray-state assertions, post-exit keyboard restoration, configured-shortcut/Settings persistence matrix, Explorer restart, startup-at-login, and Inno Setup build.
 
 ## Manual Scenarios
 
-- [x] Launch CatLocker and confirm it appears only in the tray.
+- [ ] Launch CatLocker and confirm it appears only in the tray.
 - [ ] Confirm CatLocker starts unlocked after a normal launch.
 - [ ] Confirm CatLocker starts unlocked after login startup.
 - [ ] Confirm the tray tooltip reports the unlocked state.
 - [ ] Confirm the tray menu includes `Lock Keyboard`, `Unlock Keyboard`, `Toggle Cat Mode`, `Settings`, `Start with Windows`, and `Exit`.
-- [x] Confirm the mouse remains usable while CatLocker is running.
+- [ ] Confirm the mouse remains usable while CatLocker is running.
 - [ ] Confirm `F24` locks CatLocker from a Stream Deck or equivalent sender.
 - [ ] Confirm repeated `F24` presses toggle lock state exactly once per physical press.
 - [ ] Confirm held `F24` autorepeat does not produce extra toggles.
