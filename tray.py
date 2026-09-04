@@ -575,6 +575,8 @@ class NativeTray:
         self._startup_condition = threading.Condition()
         self._startup_cancelled = threading.Event()
         self._presentation_lock = threading.Lock()
+        self._icon_cleanup_state = "available"
+        self._icon_cleanup_token = None
         self._quit_lock = threading.Lock()
         self._quit_posted = False
         self._cleanup_done = False
@@ -665,22 +667,48 @@ class NativeTray:
 
     def force_remove_icon(self) -> None:
         """Best-effort emergency removal using retained presentation data."""
+        self._delete_icon_best_effort()
+
+    def _claim_icon_delete(self):
         with self._presentation_lock:
             if self.notify_data is None or self._icon_deleted:
-                return
+                return None
+            if self._icon_cleanup_state != "available":
+                return None
             data = NOTIFYICONDATAW()
             ctypes.memmove(
                 ctypes.byref(data),
                 ctypes.byref(self.notify_data),
                 ctypes.sizeof(data),
             )
-            self._icon_deleted = True
-            try:
-                result = self.api.delete_icon(data)
-                if result is False:
-                    raise TrayStopped("NIM_DELETE failed.")
-            except BaseException as exc:
-                self.cleanup_exception = self.cleanup_exception or exc
+            token = object()
+            self._icon_cleanup_state = "in_progress"
+            self._icon_cleanup_token = token
+            return data, token
+
+    def _finish_icon_delete(self, token, *, success: bool) -> None:
+        with self._presentation_lock:
+            if self._icon_cleanup_token is not token:
+                return
+            self._icon_cleanup_state = "done" if success else "available"
+            self._icon_cleanup_token = None
+            if success:
+                self._icon_deleted = True
+
+    def _delete_icon_best_effort(self) -> None:
+        claim = self._claim_icon_delete()
+        if claim is None:
+            return
+        data, token = claim
+        try:
+            result = self.api.delete_icon(data)
+            if result is False:
+                raise TrayStopped("NIM_DELETE failed.")
+        except BaseException as exc:
+            self._finish_icon_delete(token, success=False)
+            self.cleanup_exception = self.cleanup_exception or exc
+            return
+        self._finish_icon_delete(token, success=True)
 
     def post_quit(self) -> None:
         """Best-effort, idempotent emergency quit for the tray owner thread."""
@@ -783,43 +811,57 @@ class NativeTray:
 
     def _add_current_icon(self) -> None:
         with self._presentation_lock:
-            if self.notify_data is None:
-                raise TrayStopped("Native tray notification data is unavailable.")
-            result = self.api.add_icon(self.notify_data)
-            if result is False:
-                raise OSError("NIM_ADD failed.")
-            self._icon_added = True
-            result = self.api.set_version(self.notify_data)
-            if result is False:
-                raise OSError("NIM_SETVERSION failed.")
+            data = self.notify_data
+        if data is None:
+            raise TrayStopped("Native tray notification data is unavailable.")
+        result = self.api.add_icon(data)
+        if result is False:
+            raise OSError("NIM_ADD failed.")
+        self._icon_added = True
+        result = self.api.set_version(data)
+        if result is False:
+            raise OSError("NIM_SETVERSION failed.")
 
     def _modify_current_icon(self) -> None:
         with self._presentation_lock:
             if self.notify_data is None:
                 return
             self.notify_data.szTip = self.state.tooltip
-            result = self.api.modify_icon(self.notify_data)
-            if result is False:
-                raise OSError("NIM_MODIFY failed.")
+            data = self.notify_data
+        result = self.api.modify_icon(data)
+        if result is False:
+            raise OSError("NIM_MODIFY failed.")
 
     def _drain_updates(self) -> TrayUpdate | None:
-        newest = None
+        updates = []
         while True:
             try:
-                newest = self._updates.get_nowait()
+                updates.append(self._updates.get_nowait())
             except queue.Empty:
                 break
-        if newest is None:
+        if not updates:
             return None
-        locked_changed, tooltip_changed = self.state.apply_update(newest)
-        if locked_changed or tooltip_changed:
+        newest_notification = None
+        initial_locked = self.state.locked
+        initial_tooltip = self.state.tooltip
+        for update in updates:
+            previous_locked = self.state.locked
+            self.state.apply_update(update)
+            if (
+                update.locked is not None
+                and previous_locked != self.state.locked
+                and update.reason in self._notification_reasons
+            ):
+                newest_notification = update
+        presentation_changed = (
+            initial_locked != self.state.locked
+            or initial_tooltip != self.state.tooltip
+        )
+        if presentation_changed:
             self._modify_current_icon()
-        if (
-            newest.reason in self._notification_reasons
-            and self.state.notifications_enabled
-        ):
-            self._show_notification(newest)
-        return newest
+        if newest_notification is not None and self.state.notifications_enabled:
+            self._show_notification(newest_notification)
+        return updates[-1]
 
     def _show_notification(self, update: TrayUpdate) -> None:
         if self.notify_data is None:
@@ -876,22 +918,30 @@ class NativeTray:
         with self._presentation_lock:
             if self._cleanup_done:
                 return
-            self._cleanup_done = True
-            if self.notify_data is not None and not self._icon_deleted:
-                self._icon_deleted = True
-                try:
-                    self.api.delete_icon(self.notify_data)
-                except Exception as exc:
-                    self.cleanup_exception = self.cleanup_exception or exc
-            if self.window_handle is not None and not self._window_destroyed:
+        self._delete_icon_best_effort()
+
+        with self._presentation_lock:
+            window_handle = self.window_handle
+            destroy_window = (
+                window_handle is not None and not self._window_destroyed
+            )
+            if destroy_window:
                 self._window_destroyed = True
-                try:
-                    self.api.destroy_window(self.window_handle)
-                except Exception as exc:
-                    self.cleanup_exception = self.cleanup_exception or exc
-            if self.icon_handle is not None and not self._icon_destroyed:
+            icon_handle = self.icon_handle
+            destroy_icon = icon_handle is not None and not self._icon_destroyed
+            if destroy_icon:
                 self._icon_destroyed = True
-                try:
-                    self.api.destroy_icon(self.icon_handle)
-                except Exception as exc:
-                    self.cleanup_exception = self.cleanup_exception or exc
+
+        if destroy_window:
+            try:
+                self.api.destroy_window(window_handle)
+            except BaseException as exc:
+                self.cleanup_exception = self.cleanup_exception or exc
+        if destroy_icon:
+            try:
+                self.api.destroy_icon(icon_handle)
+            except BaseException as exc:
+                self.cleanup_exception = self.cleanup_exception or exc
+
+        with self._presentation_lock:
+            self._cleanup_done = True

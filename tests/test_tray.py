@@ -361,3 +361,49 @@ def test_emergency_force_remove_icon_is_idempotent_and_retains_presentation():
     tray.post_quit()
     tray.post_quit()
     api.wait_until(lambda: not tray.is_alive())
+
+
+def test_burst_updates_preserve_every_partial_field():
+    api, tray = started_tray(notifications=True)
+    try:
+        tray._updates.put(TrayUpdate(notifications_enabled=False))
+        tray._updates.put(TrayUpdate(startup_enabled=True))
+        tray._updates.put(TrayUpdate(locked=True, reason="toggle"))
+        tray._drain_updates()
+
+        assert tray.state.locked is True
+        assert tray.state.startup_enabled is True
+        assert tray.state.notifications_enabled is False
+        assert tray.state.tooltip == "CatLocker — Keyboard Locked"
+        assert api.notification_attempts == 0
+    finally:
+        tray.stop(timeout=1)
+
+
+def test_burst_uses_latest_lock_notification_and_avoids_redundant_modify():
+    api, tray = started_tray(notifications=True)
+    try:
+        tray._updates.put(TrayUpdate(locked=True, reason="toggle"))
+        tray._updates.put(TrayUpdate(startup_enabled=True))
+        tray._updates.put(TrayUpdate(locked=False, reason="emergency"))
+        tray._drain_updates()
+
+        assert tray.state.locked is False
+        assert tray.state.startup_enabled is True
+        assert len(api.modify_calls) == 0
+        assert len(api.notification_calls) == 1
+        assert api.notification_calls[0].message == "Cat Mode OFF — Keyboard Unlocked"
+    finally:
+        tray.stop(timeout=1)
+
+
+def test_later_lock_update_replaces_earlier_custom_tooltip():
+    api, tray = started_tray()
+    try:
+        tray._updates.put(TrayUpdate(tooltip="custom"))
+        tray._updates.put(TrayUpdate(locked=True))
+        tray._drain_updates()
+
+        assert tray.state.tooltip == "CatLocker — Keyboard Locked"
+    finally:
+        tray.stop(timeout=1)
