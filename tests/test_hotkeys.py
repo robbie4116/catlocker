@@ -1,3 +1,4 @@
+import hotkeys
 import pytest
 
 from hotkeys import Shortcut, ShortcutError, parse_shortcut
@@ -148,3 +149,42 @@ def test_recorder_rejects_modifier_only_and_unknown_trigger():
 def test_recorder_rejects_an_extra_non_modifier_key():
     with pytest.raises(ShortcutError):
         shortcut_from_pressed_vks({0x41, 0x4B}, trigger_vk=0x4B)
+
+
+def test_format_pressed_vks_orders_modifiers_and_deduplicates_families():
+    formatter = getattr(hotkeys, "format_pressed_vks")
+
+    assert formatter(
+        {hotkeys.VK_LCONTROL, hotkeys.VK_RCONTROL, hotkeys.VK_LSHIFT, 0x4B}
+    ) == "Ctrl+Shift+K"
+
+
+def test_format_pressed_vks_labels_unknown_virtual_keys():
+    formatter = getattr(hotkeys, "format_pressed_vks")
+
+    assert formatter({0xFF}) == "VK_FF"
+
+
+def test_format_pressed_vks_returns_empty_for_no_pressed_keys():
+    formatter = getattr(hotkeys, "format_pressed_vks")
+
+    assert formatter(set()) == ""
+
+
+def test_format_pressed_vks_sorts_mixed_known_and_unknown_keys_by_vk():
+    formatter = getattr(hotkeys, "format_pressed_vks")
+
+    assert formatter({0x100, 0xFF, 0x4B, 0x41}) == "A+K+VK_FF+VK_100"
+
+
+def test_format_pressed_vks_uses_full_modifier_order():
+    formatter = getattr(hotkeys, "format_pressed_vks")
+    pressed = {
+        hotkeys.VK_LCONTROL,
+        hotkeys.VK_LMENU,
+        hotkeys.VK_LSHIFT,
+        hotkeys.VK_LWIN,
+        0x4B,
+    }
+
+    assert formatter(pressed) == "Ctrl+Alt+Shift+Win+K"

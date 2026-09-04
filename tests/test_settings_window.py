@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
+import hotkeys
 import pytest
+import settings_window as settings_window_module
 
 from controller import EngineUnhealthy
 from hotkeys import ShortcutError, VK_LCONTROL
@@ -299,6 +301,155 @@ def test_recording_engine_failure_clears_local_state_and_reraises():
         coordinator.begin_recording()
 
     assert coordinator.recording is False
+
+
+def test_coordinator_exposes_live_recording_text_and_clears_after_completion():
+    coordinator = make_coordinator([])
+    assert coordinator.recording_text == ""
+
+    assert coordinator.begin_recording() is True
+    assert coordinator.recording_text == ""
+    coordinator.record_keydown(VK_LCONTROL)
+    assert coordinator.recording_text == "Ctrl"
+    coordinator.record_keydown(hotkeys.VK_LSHIFT)
+    assert coordinator.recording_text == "Ctrl+Shift"
+    shortcut = coordinator.record_keydown(0x4B)
+
+    assert shortcut.canonical == "Ctrl+Shift+K"
+    assert coordinator.recording_text == ""
+
+
+def test_recording_preview_requires_new_trigger_after_releasing_unknown_extra_key():
+    coordinator = make_coordinator([])
+    coordinator.begin_recording()
+    coordinator.record_keydown(VK_LCONTROL)
+    coordinator.record_keydown(0xFF)
+    coordinator.record_keydown(0x4B)
+
+    assert coordinator.recording is True
+    assert coordinator.recording_text == "Ctrl+K+VK_FF"
+
+    coordinator.record_keyup(0xFF)
+
+    assert coordinator.recording is True
+    assert coordinator.recording_text == "Ctrl+K"
+    coordinator.record_keyup(0x4B)
+    assert coordinator.recording is True
+
+    shortcut = coordinator.record_keydown(0x4B)
+
+    assert shortcut.canonical == "Ctrl+K"
+    assert coordinator.recording is False
+
+
+@pytest.mark.parametrize(
+    ("keysym", "expected"),
+    [
+        ("Control_L", hotkeys.VK_LCONTROL),
+        ("Control_R", hotkeys.VK_RCONTROL),
+        ("Shift_L", hotkeys.VK_LSHIFT),
+        ("Shift_R", hotkeys.VK_RSHIFT),
+        ("Alt_L", hotkeys.VK_LMENU),
+        ("Alt_R", hotkeys.VK_RMENU),
+    ],
+)
+def test_normalize_tk_event_maps_left_and_right_modifier_keysyms(keysym, expected):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(None, keysym=keysym)) == expected
+
+
+@pytest.mark.parametrize(
+    ("keysym", "expected"),
+    [
+        ("Win_L", hotkeys.VK_LWIN),
+        ("Win_R", hotkeys.VK_RWIN),
+        ("Super_L", hotkeys.VK_LWIN),
+        ("Super_R", hotkeys.VK_RWIN),
+        ("Meta_L", hotkeys.VK_LWIN),
+        ("Meta_R", hotkeys.VK_RWIN),
+    ],
+)
+def test_normalize_tk_event_maps_windows_modifier_aliases(keysym, expected):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(None, keysym=keysym)) == expected
+
+
+@pytest.mark.parametrize(
+    ("keysym", "expected"),
+    [
+        ("Shift", hotkeys.VK_LSHIFT),
+        ("Control", hotkeys.VK_LCONTROL),
+        ("Ctrl", hotkeys.VK_LCONTROL),
+        ("Alt", hotkeys.VK_LMENU),
+        ("Win", hotkeys.VK_LWIN),
+        ("Super", hotkeys.VK_LWIN),
+        ("Meta", hotkeys.VK_LWIN),
+    ],
+)
+def test_normalize_tk_event_maps_bare_modifier_aliases(keysym, expected):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(None, keysym=keysym)) == expected
+
+
+@pytest.mark.parametrize(
+    ("keycode", "expected"),
+    [
+        (0x10, hotkeys.VK_LSHIFT),
+        (0x11, hotkeys.VK_LCONTROL),
+        (0x12, hotkeys.VK_LMENU),
+    ],
+)
+def test_normalize_tk_event_maps_generic_modifier_keycodes(keycode, expected):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(keycode, keysym="")) == expected
+
+
+def test_normalize_tk_event_prefers_recognized_keysym_over_conflicting_keycode():
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(0x4B, keysym=" control_l ")) == hotkeys.VK_LCONTROL
+    assert normalizer(FakeTkEvent("malformed", keysym="Control_L")) == hotkeys.VK_LCONTROL
+    assert normalizer(SimpleNamespace(keysym="Control_L")) == hotkeys.VK_LCONTROL
+
+
+@pytest.mark.parametrize(
+    ("keysym", "keycode", "expected"),
+    [
+        ("  sHiFt_r  ", 0xFF, hotkeys.VK_RSHIFT),
+        ("  cTrL  ", 0xFF, hotkeys.VK_LCONTROL),
+        ("ignored", 0x4B, 0x4B),
+    ],
+)
+def test_normalize_tk_event_normalizes_keysym_and_passes_through_triggers(
+    keysym,
+    keycode,
+    expected,
+):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(keycode, keysym=keysym)) == expected
+
+
+@pytest.mark.parametrize(
+    "keycode",
+    [hotkeys.VK_LCONTROL, hotkeys.VK_RCONTROL, hotkeys.VK_LWIN, hotkeys.VK_RWIN, 0x4B],
+)
+def test_normalize_tk_event_passes_through_existing_virtual_key_values(keycode):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    assert normalizer(FakeTkEvent(keycode, keysym="")) == keycode
+
+
+@pytest.mark.parametrize("keycode", [None, "not-a-number"])
+def test_normalize_tk_event_rejects_invalid_fallback_keycodes(keycode):
+    normalizer = getattr(settings_window_module, "normalize_tk_event")
+
+    with pytest.raises(ValueError):
+        normalizer(FakeTkEvent(keycode, keysym=""))
 
 
 class FakeTkEvent:

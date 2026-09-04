@@ -8,6 +8,15 @@ from hotkeys import (
     SUPPORTED_MODIFIER_VKS,
     Shortcut,
     ShortcutError,
+    VK_LCONTROL,
+    VK_LMENU,
+    VK_LSHIFT,
+    VK_LWIN,
+    VK_RCONTROL,
+    VK_RMENU,
+    VK_RSHIFT,
+    VK_RWIN,
+    format_pressed_vks,
     parse_shortcut,
     shortcut_from_pressed_vks,
     validate_shortcut,
@@ -21,6 +30,46 @@ class SettingsLocked(RuntimeError):
 
 class WarningDeclined(RuntimeError):
     """Raised when the user declines a shortcut warning."""
+
+
+_TK_KEYSYM_TO_VK = {
+    "shift_l": VK_LSHIFT,
+    "shift_r": VK_RSHIFT,
+    "control_l": VK_LCONTROL,
+    "control_r": VK_RCONTROL,
+    "alt_l": VK_LMENU,
+    "alt_r": VK_RMENU,
+    "win_l": VK_LWIN,
+    "win_r": VK_RWIN,
+    "super_l": VK_LWIN,
+    "super_r": VK_RWIN,
+    "meta_l": VK_LWIN,
+    "meta_r": VK_RWIN,
+    "shift": VK_LSHIFT,
+    "control": VK_LCONTROL,
+    "ctrl": VK_LCONTROL,
+    "alt": VK_LMENU,
+    "win": VK_LWIN,
+    "super": VK_LWIN,
+    "meta": VK_LWIN,
+}
+_GENERIC_TK_KEYCODES_TO_VK = {
+    0x10: VK_LSHIFT,
+    0x11: VK_LCONTROL,
+    0x12: VK_LMENU,
+}
+
+
+def normalize_tk_event(event) -> int:
+    keysym = str(getattr(event, "keysym", "") or "").strip().casefold()
+    if keysym in _TK_KEYSYM_TO_VK:
+        return _TK_KEYSYM_TO_VK[keysym]
+
+    try:
+        keycode = int(getattr(event, "keycode"))
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise ValueError("Tk event must have a numeric keycode.") from exc
+    return _GENERIC_TK_KEYCODES_TO_VK.get(keycode, keycode)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +102,10 @@ class SettingsCoordinator:
     @property
     def recording(self) -> bool:
         return self._recording
+
+    @property
+    def recording_text(self) -> str:
+        return format_pressed_vks(self._pressed_vks) if self._recording else ""
 
     def save(
         self,

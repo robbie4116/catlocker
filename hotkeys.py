@@ -203,6 +203,14 @@ def active_modifier_families(pressed: set[int]) -> frozenset[Modifier]:
     return frozenset(family for family, vks in MODIFIER_VKS.items() if pressed & vks)
 
 
+def format_pressed_vks(pressed: set[int]) -> str:
+    active_modifiers = active_modifier_families(pressed)
+    parts = [family.value for family in MODIFIER_ORDER if family in active_modifiers]
+    non_modifiers = sorted(set(pressed) - SUPPORTED_MODIFIER_VKS)
+    parts.extend(VK_TO_NAME.get(vk, f"VK_{vk:02X}") for vk in non_modifiers)
+    return "+".join(parts)
+
+
 def shortcut_from_pressed_vks(pressed: set[int], *, trigger_vk: int) -> Shortcut:
     pressed_vks = set(pressed)
     if trigger_vk in SUPPORTED_MODIFIER_VKS:
