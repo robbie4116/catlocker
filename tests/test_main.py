@@ -93,6 +93,18 @@ class FakeHook:
         self.calls.append(("hook_post_quit",))
 
 
+class StalledHookCleanup(FakeHook):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.force_started = threading.Event()
+        self.release_force = threading.Event()
+
+    def force_unhook(self):
+        self.calls.append(("hook_force_unhook",))
+        self.force_started.set()
+        self.release_force.wait(timeout=1)
+
+
 class FakeController:
     def __init__(self, calls, unlock_error=None):
         self.calls = calls
@@ -161,6 +173,18 @@ class FakeTray:
 
     def post_quit(self):
         self.calls.append(("tray_post_quit",))
+
+
+class StalledTrayCleanup(FakeTray):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.force_started = threading.Event()
+        self.release_force = threading.Event()
+
+    def force_remove_icon(self):
+        self.calls.append(("tray_force_remove_icon",))
+        self.force_started.set()
+        self.release_force.wait(timeout=1)
 
 
 class FakeSettingsWindow:
@@ -245,10 +269,13 @@ def make_app(
     unlock_error=None,
     hook_stop_error=None,
     tray_stop_error=None,
+    hook=None,
+    tray=None,
+    shutdown_timeout=None,
 ):
     calls = []
     root = FakeRoot(calls)
-    hook = FakeHook(
+    hook = hook or FakeHook(
         calls,
         SimpleNamespace(canonical="F24"),
         hook_start_error,
@@ -256,13 +283,16 @@ def make_app(
     )
     hook.start_error = hook_start_error
     controller = FakeController(calls, unlock_error=unlock_error)
-    tray = FakeTray(
+    tray = tray or FakeTray(
         calls,
         start_error=tray_start_error,
         stop_error=tray_stop_error,
     )
     coordinator = FakeCoordinator(calls, startup_result=startup_result)
     settings_window = FakeSettingsWindow(calls)
+    lifecycle_options = {}
+    if shutdown_timeout is not None:
+        lifecycle_options["shutdown_timeout"] = shutdown_timeout
     app = AppLifecycle(
         root=root,
         hook=hook,
@@ -274,6 +304,7 @@ def make_app(
         show_error=root.show_error,
         command_timeout=0.25,
         thread_timeout=0.5,
+        **lifecycle_options,
     )
     return app, calls
 
@@ -405,6 +436,74 @@ def test_tray_stop_timeout_best_effort_removes_icon_and_continues():
     app.shutdown()
     assert calls.index(("tray_force_remove_icon",)) < calls.index(("root_destroy",))
     assert len(app.tray.stop_timeouts) == 2
+
+
+def test_shutdown_deadline_survives_stalled_hook_cleanup():
+    calls = []
+    hook = StalledHookCleanup(
+        calls,
+        SimpleNamespace(canonical="F24"),
+        stop_error=TimeoutError("stalled"),
+    )
+    app, _ = make_app(hook=hook)
+    app.start()
+    finished = threading.Event()
+    shutdown_thread = threading.Thread(
+        target=lambda: (app.shutdown(), finished.set())
+    )
+    shutdown_thread.start()
+    try:
+        assert hook.force_started.wait(timeout=1)
+        assert finished.wait(timeout=app.shutdown_timeout + 0.25)
+        assert ("root_destroy",) in app.root.calls
+    finally:
+        hook.release_force.set()
+        shutdown_thread.join(timeout=1)
+
+
+def test_shutdown_deadline_survives_stalled_tray_cleanup():
+    calls = []
+    tray = StalledTrayCleanup(
+        calls,
+        stop_error=TimeoutError("stalled"),
+    )
+    app, _ = make_app(tray=tray)
+    app.start()
+    finished = threading.Event()
+    shutdown_thread = threading.Thread(
+        target=lambda: (app.shutdown(), finished.set())
+    )
+    shutdown_thread.start()
+    try:
+        assert tray.force_started.wait(timeout=1)
+        assert finished.wait(timeout=app.shutdown_timeout + 0.25)
+        assert ("root_destroy",) in app.root.calls
+    finally:
+        tray.release_force.set()
+        shutdown_thread.join(timeout=1)
+
+
+def test_shutdown_with_zero_remaining_budget_still_destroys_root():
+    calls = []
+    hook = StalledHookCleanup(
+        calls,
+        SimpleNamespace(canonical="F24"),
+        stop_error=TimeoutError("stalled"),
+    )
+    app, _ = make_app(hook=hook, shutdown_timeout=0)
+    app.start()
+    finished = threading.Event()
+    shutdown_thread = threading.Thread(
+        target=lambda: (app.shutdown(), finished.set())
+    )
+    shutdown_thread.start()
+    try:
+        assert hook.force_started.wait(timeout=1)
+        assert finished.wait(timeout=0.25)
+        assert ("root_destroy",) in app.root.calls
+    finally:
+        hook.release_force.set()
+        shutdown_thread.join(timeout=1)
 
 
 def test_shutdown_is_idempotent_after_first_close():

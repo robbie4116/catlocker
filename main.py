@@ -5,6 +5,7 @@ import os
 import queue
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -78,6 +79,7 @@ class AppLifecycle:
         show_error: Callable[[BaseException], object],
         command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
         thread_timeout: float = DEFAULT_THREAD_TIMEOUT,
+        shutdown_timeout: float | None = None,
         pump_interval_ms: int = PUMP_INTERVAL_MS,
         startup_registry: object | None = None,
     ) -> None:
@@ -91,6 +93,15 @@ class AppLifecycle:
         self._show_error = show_error
         self.command_timeout = _finite_timeout(command_timeout, "command")
         self.thread_timeout = _finite_timeout(thread_timeout, "thread")
+        configured_shutdown_timeout = (
+            self.command_timeout + (4 * self.thread_timeout)
+            if shutdown_timeout is None
+            else shutdown_timeout
+        )
+        self.shutdown_timeout = _finite_timeout(
+            configured_shutdown_timeout,
+            "shutdown",
+        )
         self.pump_interval_ms = int(pump_interval_ms)
         self.startup_registry = startup_registry
         self._main_thread_id = threading.get_ident()
@@ -153,6 +164,7 @@ class AppLifecycle:
         """Fail open first, then perform bounded best-effort cleanup."""
         if self._closing:
             return
+        deadline = time.monotonic() + self.shutdown_timeout
         self._closing = True
         self._running = False
         self._pump_scheduled = False
@@ -164,13 +176,40 @@ class AppLifecycle:
         finally:
             self._enter_fail_open()
 
-        self._stop_hook()
-        self._stop_tray()
+        self._stop_hook(deadline)
+        self._stop_tray(deadline)
         self._destroy_root()
 
-    def _stop_hook(self) -> None:
+    @staticmethod
+    def _remaining(deadline: float, cap: float) -> float:
+        return min(cap, max(0.0, deadline - time.monotonic()))
+
+    def _emergency_call(
+        self,
+        operation: Callable[[], object],
+        deadline: float,
+    ) -> None:
+        errors: list[BaseException] = []
+
+        def invoke() -> None:
+            try:
+                operation()
+            except BaseException as error:
+                errors.append(error)
+
+        worker = threading.Thread(
+            target=invoke,
+            name="CatLockerEmergencyCleanup",
+            daemon=True,
+        )
+        worker.start()
+        worker.join(self._remaining(deadline, self.thread_timeout))
+        if errors:
+            self._report_error(errors[0])
+
+    def _stop_hook(self, deadline: float) -> None:
         try:
-            self.hook.stop(timeout=self.thread_timeout)
+            self.hook.stop(timeout=self._remaining(deadline, self.thread_timeout))
             return
         except BaseException as error:
             self._report_error(error)
@@ -179,36 +218,24 @@ class AppLifecycle:
             self.hook.enter_fail_open()
         except BaseException as error:
             self._report_error(error)
+        self._emergency_call(self.hook.force_unhook, deadline)
+        self._emergency_call(self.hook.post_quit, deadline)
         try:
-            self.hook.force_unhook()
-        except BaseException as error:
-            self._report_error(error)
-        try:
-            self.hook.post_quit()
-        except BaseException as error:
-            self._report_error(error)
-        try:
-            self.hook.stop(timeout=self.thread_timeout)
+            self.hook.stop(timeout=self._remaining(deadline, self.thread_timeout))
         except BaseException as error:
             self._report_error(error)
 
-    def _stop_tray(self) -> None:
+    def _stop_tray(self, deadline: float) -> None:
         try:
-            self.tray.stop(timeout=self.thread_timeout)
+            self.tray.stop(timeout=self._remaining(deadline, self.thread_timeout))
             return
         except BaseException as error:
             self._report_error(error)
 
+        self._emergency_call(self.tray.force_remove_icon, deadline)
+        self._emergency_call(self.tray.post_quit, deadline)
         try:
-            self.tray.force_remove_icon()
-        except BaseException as error:
-            self._report_error(error)
-        try:
-            self.tray.post_quit()
-        except BaseException as error:
-            self._report_error(error)
-        try:
-            self.tray.stop(timeout=self.thread_timeout)
+            self.tray.stop(timeout=self._remaining(deadline, self.thread_timeout))
         except BaseException as error:
             self._report_error(error)
 

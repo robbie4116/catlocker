@@ -23,6 +23,9 @@ WM_APP_COMMAND = 0x8001
 PM_NOREMOVE = 0x0000
 LLKHF_INJECTED = 0x10
 MAX_SAFE_TIMEOUT = threading.TIMEOUT_MAX
+_CLEANUP_AVAILABLE = "available"
+_CLEANUP_IN_PROGRESS = "in_progress"
+_CLEANUP_DONE = "done"
 
 ULONG_PTR = ctypes.c_size_t
 LRESULT = ctypes.c_ssize_t
@@ -328,8 +331,12 @@ class KeyboardHook:
         self.shortcut_generation = 0
 
         self._hook_lock = threading.Lock()
+        self._hook_cleanup_state = _CLEANUP_AVAILABLE
+        self._hook_cleanup_token = None
         self._quit_lock = threading.Lock()
         self._quit_posted = False
+        self._quit_state = _CLEANUP_AVAILABLE
+        self._quit_token = None
         self._owner_thread_ident: int | None = None
         self._startup_condition = threading.Condition()
         self._startup_cancelled = threading.Event()
@@ -452,38 +459,81 @@ class KeyboardHook:
     def force_unhook(self) -> None:
         """Best-effort emergency unhook callable from the lifecycle owner."""
         self._force_fail_open_unlocked()
-        with self._hook_lock:
-            handle = self.hook_handle
-            if handle is None:
-                return
-            try:
-                unhooked = self.api.unhook(handle)
-                if not unhooked:
-                    raise HookStopped("Win32 unhook did not report success.")
-            except BaseException as exc:
-                self._report_cleanup_error(exc)
-                return
-            if self.hook_handle == handle:
-                self.hook_handle = None
-            self.cleanup_exception = None
+        claim = self._claim_hook_cleanup()
+        if claim is None:
+            return
+        handle, token = claim
+        try:
+            unhooked = self.api.unhook(handle)
+            if not unhooked:
+                raise HookStopped("Win32 unhook did not report success.")
+        except BaseException as exc:
+            self._finish_hook_cleanup(token, success=False)
+            self._report_cleanup_error(exc)
+            return
+        self._finish_hook_cleanup(token, success=True)
 
     def post_quit(self) -> None:
         """Best-effort, idempotent emergency quit for the hook owner thread."""
         self._force_fail_open_unlocked()
+        claim = self._claim_quit()
+        if claim is None:
+            return
+        thread_id, token = claim
+        try:
+            posted = self.api.post_thread_message(thread_id, WM_QUIT, 0, 0)
+            if not posted:
+                raise HookStopped("Keyboard hook thread stopped accepting quit.")
+        except BaseException as exc:
+            self._finish_quit(token, success=False)
+            self._report_cleanup_error(exc)
+            return
+        self._finish_quit(token, success=True)
+
+    def _claim_hook_cleanup(self):
+        with self._hook_lock:
+            if self.hook_handle is None:
+                return None
+            if self._hook_cleanup_state != _CLEANUP_AVAILABLE:
+                return None
+            token = object()
+            self._hook_cleanup_state = _CLEANUP_IN_PROGRESS
+            self._hook_cleanup_token = token
+            return self.hook_handle, token
+
+    def _finish_hook_cleanup(self, token, *, success: bool) -> None:
+        with self._hook_lock:
+            if self._hook_cleanup_token is not token:
+                return
+            if success:
+                self.hook_handle = None
+                self._hook_cleanup_state = _CLEANUP_DONE
+                self.cleanup_exception = None
+            else:
+                self._hook_cleanup_state = _CLEANUP_AVAILABLE
+            self._hook_cleanup_token = None
+
+    def _claim_quit(self):
         with self._quit_lock:
-            if self._quit_posted:
+            if self._quit_state != _CLEANUP_AVAILABLE:
+                return None
+            if self.thread_id is None:
+                return None
+            token = object()
+            self._quit_state = _CLEANUP_IN_PROGRESS
+            self._quit_token = token
+            return self.thread_id, token
+
+    def _finish_quit(self, token, *, success: bool) -> None:
+        with self._quit_lock:
+            if self._quit_token is not token:
                 return
-            thread_id = self.thread_id
-            if thread_id is None:
-                return
-            try:
-                posted = self.api.post_thread_message(thread_id, WM_QUIT, 0, 0)
-                if not posted:
-                    raise HookStopped("Keyboard hook thread stopped accepting quit.")
-            except BaseException as exc:
-                self._report_cleanup_error(exc)
-                return
-            self._quit_posted = True
+            if success:
+                self._quit_posted = True
+                self._quit_state = _CLEANUP_DONE
+            else:
+                self._quit_state = _CLEANUP_AVAILABLE
+            self._quit_token = None
 
     def _create_command(
         self,
@@ -551,6 +601,7 @@ class KeyboardHook:
             with self._startup_condition:
                 with self._hook_lock:
                     self.hook_handle = handle
+                    self._hook_cleanup_state = _CLEANUP_AVAILABLE
                 if self._startup_cancelled.is_set():
                     self._force_fail_open_unlocked()
                     cancel_install = True
@@ -756,14 +807,17 @@ class KeyboardHook:
             pass
 
     def _post_quit_owner(self) -> None:
-        with self._quit_lock:
-            if self._quit_posted:
-                return
-            try:
-                self.api.post_quit(0)
-            except BaseException:
-                return
-            self._quit_posted = True
+        claim = self._claim_quit()
+        if claim is None:
+            return
+        _, token = claim
+        try:
+            self.api.post_quit(0)
+        except BaseException as exc:
+            self._finish_quit(token, success=False)
+            self._report_cleanup_error(exc)
+            return
+        self._finish_quit(token, success=True)
 
     def _reject_pending_commands(self) -> None:
         with self._pending_lock:
@@ -839,21 +893,20 @@ class KeyboardHook:
         self._put_event_safely(EngineEvent("fatal", False, "cleanup", error))
 
     def _unhook_owner(self) -> bool:
-        with self._hook_lock:
-            handle = self.hook_handle
-            if handle is None:
-                return True
-            try:
-                unhooked = self.api.unhook(handle)
-            except BaseException as exc:
-                self._report_cleanup_error(exc)
-                return False
-            if not unhooked:
-                self._report_cleanup_error(
-                    HookStopped("Win32 unhook did not report success.")
+        claim = self._claim_hook_cleanup()
+        if claim is None:
+            with self._hook_lock:
+                return self.hook_handle is None or (
+                    self._hook_cleanup_state == _CLEANUP_IN_PROGRESS
                 )
-                return False
-            if self.hook_handle == handle:
-                self.hook_handle = None
-        self.cleanup_exception = None
+        handle, token = claim
+        try:
+            unhooked = self.api.unhook(handle)
+            if not unhooked:
+                raise HookStopped("Win32 unhook did not report success.")
+        except BaseException as exc:
+            self._finish_hook_cleanup(token, success=False)
+            self._report_cleanup_error(exc)
+            return False
+        self._finish_hook_cleanup(token, success=True)
         return True

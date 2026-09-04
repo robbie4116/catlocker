@@ -25,6 +25,7 @@ from keyboard_hook import (
     event_from_message,
 )
 from hotkeys import parse_shortcut
+from controller import CatModeController, EngineUnhealthy
 
 
 class FakeWin32Api:
@@ -1115,6 +1116,58 @@ def test_timed_out_claimed_state_command_is_canceled_before_commit():
         if submitter is not None:
             submitter.join(timeout=1)
         hook.stop(timeout=1)
+
+
+def test_commit_operation_does_not_block_timeout_cancellation(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    original_set_locked = hook.state.set_locked
+
+    def paused_set_locked(locked):
+        if locked:
+            commit_started.set()
+            if not release_commit.wait(timeout=1):
+                raise AssertionError("test did not release the committed operation")
+        return original_set_locked(locked)
+
+    monkeypatch.setattr(hook.state, "set_locked", paused_set_locked)
+    controller = CatModeController(hook, command_timeout=0.01)
+    submit_errors = []
+    submitter_done = threading.Event()
+    submitter = threading.Thread(
+        target=lambda: _submit_and_record(
+            controller.lock,
+            submit_errors,
+            submitter_done,
+        )
+    )
+    submitter.start()
+    try:
+        assert commit_started.wait(timeout=1)
+        assert submitter_done.wait(timeout=0.25)
+        assert len(submit_errors) == 1
+        assert isinstance(submit_errors[0], EngineUnhealthy)
+        assert hook.fail_open.is_set()
+        assert hook.locked is False
+        with pytest.raises(HookStopped):
+            hook.submit(CommandKind.SET_LOCKED, True, timeout=0.01)
+    finally:
+        release_commit.set()
+        submitter.join(timeout=1)
+        hook.submit(CommandKind.FAIL_OPEN, timeout=1)
+        assert hook.state.locked is False
+        hook.stop(timeout=1)
+
+
+def _submit_and_record(operation, errors, done):
+    try:
+        operation()
+    except BaseException as exc:
+        errors.append(exc)
+    finally:
+        done.set()
 
 
 @pytest.mark.parametrize("failure", ["return_false", "raise"])
