@@ -22,7 +22,7 @@ Use this checklist to record manual verification on Windows 11. Mark each item a
 
 - Overall result: Partial acceptance completed; native startup, equivalent keyboard delivery, tray mouse interaction, and graceful cleanup passed.
 - Notes: The packaged one-file executable started responsive with no main window. Equivalent F24 toggle, repeated/held F24, exact Left Ctrl + Right Ctrl recovery, and a locked-path tray Exit sequence were delivered. Tray owner HWND and both one-file processes were gone after Exit. The computer-use UI bridge was unavailable, so visual tray/tooltip/menu assertions were not observable.
-- Pending items: Physical Stream Deck/F24 validation, visual tray-state assertions, configured-shortcut/Settings persistence matrix, Explorer restart, startup-at-login, and Inno Setup build.
+- Pending items: Physical Stream Deck/F24 validation, visual tray-state assertions, post-exit keyboard restoration, configured-shortcut/Settings persistence matrix, Explorer restart, startup-at-login, and Inno Setup build.
 
 ## Manual Scenarios
 
@@ -60,7 +60,7 @@ Use this checklist to record manual verification on Windows 11. Mark each item a
 - [ ] Confirm `WH_KEYBOARD_LL` is the keyboard mechanism in use and no mouse hook is installed.
 - [ ] Confirm elevated windows do not claim any special bypass or evasion behavior.
 - [ ] Confirm proprietary HID / anti-cheat limitations are documented without evasion claims.
-- [x] Confirm exit while locked restores normal keyboard behavior and removes the tray icon.
+- [ ] Confirm exit while locked restores normal keyboard behavior and removes the tray icon.
 - [ ] Confirm `LICENSE` and upstream Axorax/Keylock credit are present in the release docs.
 
 ## Evidence
