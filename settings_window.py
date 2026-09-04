@@ -649,7 +649,7 @@ class SettingsWindow:
             state="normal" if self.view.save_enabled else "disabled",
         )
         self.hotkey_entry.configure(
-            state="normal" if self.view.hotkey_enabled else "disabled",
+            state="disabled" if self.view.locked else "readonly",
         )
 
     def _show_error(self, error: BaseException) -> None:
