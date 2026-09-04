@@ -38,6 +38,19 @@ class CommandKind(Enum):
     STOP = auto()
 
 
+class _ImmediateGate:
+    """A tiny GIL-protected terminal gate with no blocking operations."""
+
+    def __init__(self) -> None:
+        self._set = False
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def set(self) -> None:
+        self._set = True
+
+
 class _CommandLifecycle:
     def __init__(self) -> None:
         self._lock = threading.Lock()
@@ -66,7 +79,7 @@ class _CommandLifecycle:
             if self._canceled:
                 return False, None
             self._commit_started = True
-            return True, operation()
+        return True, operation()
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +109,11 @@ class EngineEvent:
     locked: bool
     reason: str | None = None
     error: BaseException | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class HookSnapshot:
+    locked: bool
 
 
 class HookStopped(RuntimeError):
@@ -297,9 +315,10 @@ class KeyboardHook:
     ) -> None:
         self.api = api if api is not None else Win32Api()
         self.state = InputState(shortcut, locked=locked)
+        self._published_snapshot = HookSnapshot(bool(self.state.locked))
         self.thread: threading.Thread | None = None
         self.ready = threading.Event()
-        self.fail_open = threading.Event()
+        self.fail_open = _ImmediateGate()
         self.events: queue.SimpleQueue[EngineEvent] = queue.SimpleQueue()
         self.thread_id: int | None = None
         self.hook_handle: HHOOK | int | None = None
@@ -311,9 +330,7 @@ class KeyboardHook:
         self._hook_lock = threading.Lock()
         self._quit_lock = threading.Lock()
         self._quit_posted = False
-        self._state_lock = threading.Lock()
-        self._fail_open_pending = threading.Event()
-        self._callback_failure: BaseException | None = None
+        self._owner_thread_ident: int | None = None
         self._startup_condition = threading.Condition()
         self._startup_cancelled = threading.Event()
         self._pending_lock = threading.Lock()
@@ -323,10 +340,13 @@ class KeyboardHook:
 
     @property
     def locked(self) -> bool:
-        with self._state_lock:
-            if self._fail_open_active():
-                return False
-            return self.state.locked
+        snapshot = self._read_published_snapshot()
+        if self._fail_open_active():
+            return False
+        return snapshot.locked
+
+    def _read_published_snapshot(self) -> HookSnapshot:
+        return self._published_snapshot
 
     def is_alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
@@ -427,15 +447,7 @@ class KeyboardHook:
             return result
 
     def enter_fail_open(self) -> None:
-        with self._state_lock:
-            self._enter_fail_open_locked("fail_open")
-        if not self.is_alive() or self.thread_id is None:
-            return
-        command = self._create_command(CommandKind.FAIL_OPEN)
-        try:
-            self._post_command(command)
-        except BaseException:
-            self._remove_command(command)
+        self._request_fail_open("fail_open")
 
     def force_unhook(self) -> None:
         """Best-effort emergency unhook callable from the lifecycle owner."""
@@ -522,6 +534,7 @@ class KeyboardHook:
 
     def _run(self) -> None:
         try:
+            self._owner_thread_ident = threading.get_ident()
             get_thread_id = getattr(self.api, "get_current_thread_id", None)
             self.thread_id = int(
                 get_thread_id()
@@ -616,10 +629,10 @@ class KeyboardHook:
             self._post_quit_owner()
             return accepted
         if command.kind is CommandKind.FAIL_OPEN:
-            with self._state_lock:
-                self._enter_fail_open_locked("fail_open")
-                committed, _ = command.lifecycle.commit(lambda: None)
-                return committed
+            committed, _ = command.lifecycle.commit(
+                lambda: self._reconcile_fail_open("fail_open")
+            )
+            return committed
         if self._fail_open_active():
             return False
         if command.kind is CommandKind.SET_LOCKED:
@@ -661,28 +674,30 @@ class KeyboardHook:
         return False
 
     def _commit_command(self, command: HookCommand, operation):
-        with self._state_lock:
-            if self._enter_pending_fail_open_locked() or self._fail_open_active():
-                return False, None
-            committed, result = command.lifecycle.commit(operation)
-            if committed and self._fail_open_active():
-                if not self._enter_pending_fail_open_locked():
-                    self._enter_fail_open_locked("fail_open")
+        if self._fail_open_active():
+            return False, None
+        committed, result = command.lifecycle.commit(operation)
+        if committed:
+            if self._fail_open_active():
+                self._reconcile_fail_open("fail_open")
                 return False, result
-            return committed, result
+            self._publish_snapshot()
+        return committed, result
 
     def _commit_state_command(self, command: HookCommand, operation):
-        with self._state_lock:
-            if self._enter_pending_fail_open_locked() or self._fail_open_active():
-                return False, None
-            committed, transition = command.lifecycle.commit(operation)
-            if committed:
-                if self._fail_open_active():
-                    if not self._enter_pending_fail_open_locked():
-                        self._enter_fail_open_locked("fail_open")
-                    return False, transition
-                self._publish_transition(transition)
-            return committed, transition
+        if self._fail_open_active():
+            return False, None
+        committed, transition = command.lifecycle.commit(operation)
+        if committed:
+            if self._fail_open_active():
+                self._reconcile_fail_open("fail_open")
+                return False, transition
+            self._publish_snapshot()
+            self._publish_transition(transition)
+        return committed, transition
+
+    def _publish_snapshot(self) -> None:
+        self._published_snapshot = HookSnapshot(bool(self.state.locked))
 
     def _publish_transition(self, transition) -> None:
         if transition.changed and not (transition.locked and self._fail_open_active()):
@@ -690,33 +705,36 @@ class KeyboardHook:
                 EngineEvent("state", transition.locked, transition.reason)
             )
 
-    def _force_unlocked(self) -> None:
-        with self._state_lock:
-            try:
-                self.state.set_locked(False)
-            except BaseException:
-                self.state.locked = False
-
     def _force_fail_open_unlocked(self) -> None:
-        with self._state_lock:
-            self.fail_open.set()
-            try:
-                self.state.set_locked(False)
-            except BaseException:
-                self.state.locked = False
+        self._request_fail_open("fail_open")
 
-    def _enter_fail_open_locked(self, reason: str) -> None:
-        self._enter_fail_open_locked_with_error(reason, None)
-
-    def _enter_fail_open_locked_with_error(
+    def _request_fail_open(
         self,
         reason: str,
-        error: BaseException | None,
+        error: BaseException | None = None,
     ) -> None:
+        self.fail_open.set()
+        if self._owner_thread_ident == threading.get_ident():
+            self._reconcile_fail_open(reason, error)
+            return
+        if error is not None:
+            self._put_event_safely(EngineEvent("fatal", False, reason, error))
+        if not self.is_alive() or self.thread_id is None:
+            return
+        command = self._create_command(CommandKind.FAIL_OPEN)
         try:
-            self.fail_open.set()
+            self._post_command(command)
         except BaseException:
-            pass
+            self._remove_command(command)
+
+    def _fail_open_active(self) -> bool:
+        return self.fail_open.is_set()
+
+    def _reconcile_fail_open(
+        self,
+        reason: str,
+        error: BaseException | None = None,
+    ) -> None:
         transition = None
         try:
             transition = self.state.set_locked(False)
@@ -725,25 +743,11 @@ class KeyboardHook:
                 self.state.locked = False
             except BaseException:
                 pass
-        try:
-            if transition is not None and transition.changed:
-                self._put_event_safely(EngineEvent("state", False, reason))
-        except BaseException:
-            pass
+        self._publish_snapshot()
+        if transition is not None and transition.changed:
+            self._put_event_safely(EngineEvent("state", False, reason))
         if error is not None:
             self._put_event_safely(EngineEvent("fatal", False, reason, error))
-
-    def _fail_open_active(self) -> bool:
-        return self.fail_open.is_set() or self._fail_open_pending.is_set()
-
-    def _enter_pending_fail_open_locked(self) -> bool:
-        if not self._fail_open_pending.is_set():
-            return False
-        error = self._callback_failure
-        self._callback_failure = None
-        self._fail_open_pending.clear()
-        self._enter_fail_open_locked_with_error("callback", error)
-        return True
 
     def _put_event_safely(self, event: EngineEvent) -> None:
         try:
@@ -777,58 +781,29 @@ class KeyboardHook:
                 )
 
     def _callback(self, n_code, w_param, l_param):
-        acquired = False
         try:
             if n_code < HC_ACTION or self._fail_open_active():
                 return self._call_next_or_zero(n_code, w_param, l_param)
-            acquired = self._state_lock.acquire(blocking=False)
-            if not acquired:
-                return self._call_next_or_zero(n_code, w_param, l_param)
 
-            suppress = False
-            try:
-                if not self._fail_open_active():
-                    data = ctypes.cast(
-                        l_param,
-                        ctypes.POINTER(KBDLLHOOKSTRUCT),
-                    ).contents
-                    event = event_from_message(int(w_param), data)
-                    if event is not None and not self._fail_open_active():
-                        transition = self.state.handle(event)
-                        if transition.changed:
-                            self.events.put(
-                                EngineEvent(
-                                    "state",
-                                    transition.locked,
-                                    transition.reason,
-                                )
-                            )
-                        suppress = transition.suppress
-            except BaseException as exc:
-                self._fail_open_locked_safely(exc)
-                callback_error = exc
-            else:
-                callback_error = None
-            finally:
-                try:
-                    self._state_lock.release()
-                except BaseException:
-                    pass
-                acquired = False
-            if callback_error is not None:
+            data = ctypes.cast(
+                l_param,
+                ctypes.POINTER(KBDLLHOOKSTRUCT),
+            ).contents
+            event = event_from_message(int(w_param), data)
+            if event is None or self._fail_open_active():
                 return self._call_next_or_zero(n_code, w_param, l_param)
-            if suppress:
+            transition = self.state.handle(event)
+            self._publish_snapshot()
+            if transition.changed:
+                self._publish_transition(transition)
+            if self._fail_open_active():
+                return self._call_next_or_zero(n_code, w_param, l_param)
+            if transition.suppress:
                 return 1
             return self._call_next_or_zero(n_code, w_param, l_param)
         except BaseException as exc:
             self._request_callback_fail_open(exc)
-            return 0
-        finally:
-            if acquired:
-                try:
-                    self._state_lock.release()
-                except BaseException:
-                    pass
+            return self._call_next_or_zero(n_code, w_param, l_param)
 
     def _call_next_or_zero(self, n_code, w_param, l_param) -> int:
         try:
@@ -845,36 +820,11 @@ class KeyboardHook:
     def _callback_fail_open(self, error: BaseException) -> None:
         self._request_callback_fail_open(error)
 
-    def _fail_open_locked_safely(self, error: BaseException) -> None:
-        try:
-            self._enter_fail_open_locked_with_error("callback", error)
-        except BaseException:
-            pass
-
     def _request_callback_fail_open(self, error: BaseException) -> None:
-        acquired = False
-        try:
-            acquired = self._state_lock.acquire(blocking=False)
-            if acquired:
-                self._callback_failure = None
-                self._fail_open_pending.clear()
-                self._enter_fail_open_locked_with_error("callback", error)
-            else:
-                self._callback_failure = error
-                self._fail_open_pending.set()
-        except BaseException:
-            pass
-        finally:
-            if acquired:
-                try:
-                    self._state_lock.release()
-                except BaseException:
-                    pass
+        self._request_fail_open("callback", error)
 
     def _fail_open(self, reason: str, error: BaseException) -> None:
-        with self._state_lock:
-            self._enter_pending_fail_open_locked()
-            self._enter_fail_open_locked_with_error(reason, error)
+        self._request_fail_open(reason, error)
 
     def _raise_cleanup_error_if_needed(self) -> None:
         error = self.cleanup_exception
