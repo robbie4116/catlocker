@@ -112,6 +112,13 @@ class PartiallyStartedHook(FakeHook):
         raise HookTimeout("hook startup timed out")
 
 
+class PartiallyStartedStalledHook(StalledHookCleanup):
+    def start(self, timeout):
+        self.wait_timeouts.append(timeout)
+        self.calls.append(("hook_start_attempt",))
+        raise HookTimeout("hook startup timed out")
+
+
 class FakeController:
     def __init__(self, calls, unlock_error=None):
         self.calls = calls
@@ -197,6 +204,13 @@ class StalledTrayCleanup(FakeTray):
 
 
 class PartiallyStartedTray(FakeTray):
+    def start(self, timeout):
+        self.wait_timeouts.append(timeout)
+        self.calls.append(("tray_start_attempt",))
+        raise TrayTimeout("tray startup timed out")
+
+
+class PartiallyStartedStalledTray(StalledTrayCleanup):
     def start(self, timeout):
         self.wait_timeouts.append(timeout)
         self.calls.append(("tray_start_attempt",))
@@ -426,6 +440,47 @@ def test_tray_start_timeout_stops_partially_started_tray():
 
     assert ("tray_stop",) in tray.calls
     assert ("hook_stop",) in calls
+
+
+@pytest.mark.parametrize("component", ["hook", "tray"])
+def test_startup_failure_cleanup_is_bounded_for_stalled_workers(component):
+    if component == "hook":
+        worker = PartiallyStartedStalledHook(
+            [],
+            SimpleNamespace(canonical="F24"),
+            stop_error=TimeoutError("hook cleanup stalled"),
+        )
+        app, _ = make_app(hook=worker)
+        started = worker.force_started
+        release = worker.release_force
+    else:
+        worker = PartiallyStartedStalledTray(
+            [],
+            stop_error=TimeoutError("tray cleanup stalled"),
+        )
+        app, _ = make_app(tray=worker)
+        started = worker.force_started
+        release = worker.release_force
+
+    finished = threading.Event()
+
+    def start_application():
+        try:
+            app.start()
+        except (HookTimeout, TrayTimeout):
+            pass
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=start_application)
+    thread.start()
+    try:
+        assert started.wait(timeout=1)
+        assert finished.wait(timeout=app.shutdown_timeout + 0.25)
+        assert ("root_destroy",) in app.root.calls
+    finally:
+        release.set()
+        thread.join(timeout=1)
 
 
 def test_shutdown_unlock_receives_remaining_global_budget():

@@ -123,6 +123,7 @@ class AppLifecycle:
         if self._closing:
             return
 
+        startup_deadline = time.monotonic() + self.shutdown_timeout
         self.root.withdraw()
         hook_attempted = False
         tray_attempted = False
@@ -138,15 +139,9 @@ class AppLifecycle:
         except BaseException as error:
             self._running = False
             if tray_attempted:
-                try:
-                    self.tray.stop(timeout=self.thread_timeout)
-                except BaseException:
-                    pass
+                self._stop_tray(startup_deadline)
             if hook_attempted:
-                try:
-                    self.hook.stop(timeout=self.thread_timeout)
-                except BaseException:
-                    pass
+                self._stop_hook(startup_deadline)
             self._report_error(error)
             self._destroy_root()
             raise

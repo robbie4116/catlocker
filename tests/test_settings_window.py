@@ -15,6 +15,7 @@ from settings_window import (
     StartupUpdateResult,
     WarningDeclined,
 )
+from tray import TrayStopped
 
 
 _UNSET = object()
@@ -98,6 +99,7 @@ def make_coordinator(
     rollback_result=_UNSET,
     startup=None,
     controller_options=None,
+    notification_error=None,
 ):
     controller = FakeController(
         calls,
@@ -114,6 +116,8 @@ def make_coordinator(
 
     def apply_notifications(enabled):
         calls.append(("notifications", enabled))
+        if notification_error is not None:
+            raise notification_error
 
     coordinator = SettingsCoordinator(
         current,
@@ -585,6 +589,23 @@ def test_settings_startup_change_publishes_result_to_application(monkeypatch):
 
     assert results == [StartupUpdateResult(True)]
     assert window.view.startup_enabled is True
+
+
+def test_tray_loss_during_settings_save_routes_to_fatal_callback(monkeypatch):
+    error = TrayStopped("tray disappeared")
+    coordinator = make_coordinator([], notification_error=error)
+    fatal_errors = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_engine_unhealthy=fatal_errors.append,
+    )
+    window.hotkey_var.set("K")
+    window.notifications_var.set(False)
+
+    window._save()
+
+    assert fatal_errors == [error]
 
 
 def test_settings_startup_failure_publishes_actual_state(monkeypatch):

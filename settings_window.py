@@ -431,7 +431,12 @@ class SettingsWindow:
             return
         except Exception as exc:
             self.hotkey_var.set(self.view.hotkey_text)
-            self._show_error(exc)
+            from tray import TrayStopped
+
+            if isinstance(exc, TrayStopped):
+                self._handle_engine_unhealthy(exc)
+            else:
+                self._show_error(exc)
             return
         self.hotkey_var.set(self.view.hotkey_text)
         self.status_var.set("Settings saved.")
