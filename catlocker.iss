@@ -6,6 +6,7 @@
 
 [Setup]
 AppId={{4CED7309-FFEB-402D-9132-DFF4929DA1DA}
+MinVersion=10.0.22000
 AppName={#AppName}
 AppVersion={#Version}
 AppPublisher={#Author}

@@ -154,9 +154,9 @@ class MenuState:
 def build_menu_state(*, locked: bool, startup_enabled: bool) -> MenuState:
     return MenuState(
         items=(
-            MenuItemState(MenuCommand.LOCK, "Lock", not locked),
-            MenuItemState(MenuCommand.UNLOCK, "Unlock", locked),
-            MenuItemState(MenuCommand.TOGGLE, "Toggle"),
+            MenuItemState(MenuCommand.LOCK, "Lock Keyboard", not locked),
+            MenuItemState(MenuCommand.UNLOCK, "Unlock Keyboard", locked),
+            MenuItemState(MenuCommand.TOGGLE, "Toggle Cat Mode"),
             MenuItemState(MenuCommand.SETTINGS, "Settings", not locked),
             MenuItemState(MenuCommand.STARTUP, "Start with Windows", True, startup_enabled),
             MenuItemState(MenuCommand.EXIT, "Exit"),

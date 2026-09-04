@@ -88,4 +88,4 @@ If `ISCC.exe` is unavailable on the machine, installer verification is pending.
 
 ## Credits and license
 
-CatLocker is a fork of Keylock by Axorax. The upstream credit is preserved, and the project remains under the GPL. See [LICENSE](LICENSE).
+CatLocker is a fork of Keylock by Axorax. The upstream credit is preserved, and the project remains under the AGPL-3.0 license. See [LICENSE](LICENSE).
