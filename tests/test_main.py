@@ -237,6 +237,7 @@ class RecordingFactories:
         self.tray_notifications = None
         self.tray_startup_enabled = None
         self.coordinator_settings = None
+        self.startup_command = None
 
     def create_root(self):
         self.root = FakeRoot(self.calls)
@@ -251,6 +252,7 @@ class RecordingFactories:
         return FakeController(self.calls)
 
     def create_startup_registry(self, command):
+        self.startup_command = command
         return SimpleNamespace(is_enabled=lambda: self.startup_enabled)
 
     def create_tray(self, actions, startup_enabled, notifications, icon_path):
@@ -459,6 +461,121 @@ def test_create_application_wires_loaded_settings_and_actual_startup(tmp_path):
     assert factories.tray_notifications is False
     assert factories.tray_startup_enabled is True
     assert factories.coordinator_settings == AppSettings("Ctrl+Alt+F12", False)
+
+
+def test_frozen_mode_builds_executable_only_startup_command(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    factories = RecordingFactories()
+    create_application(
+        config_path=tmp_path / "config.toml",
+        executable=Path(r"C:\Program Files\CatLocker\CatLocker.exe"),
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.startup_command == (
+        '"C:\\Program Files\\CatLocker\\CatLocker.exe" --startup'
+    )
+
+
+def test_source_mode_prefers_sibling_pythonw_for_startup(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    python_dir = tmp_path / "Python"
+    python_dir.mkdir()
+    python = python_dir / "python.exe"
+    pythonw = python_dir / "pythonw.exe"
+    python.write_bytes(b"")
+    pythonw.write_bytes(b"")
+    factories = RecordingFactories()
+    create_application(
+        config_path=tmp_path / "config.toml",
+        executable=python,
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.startup_command == (
+        f'"{pythonw}" "{(ROOT / "main.py").resolve()}" --startup'
+    )
+
+
+def test_source_mode_falls_back_to_resolved_sys_executable(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    factories = RecordingFactories()
+    executable = Path(r"C:\Portable Python\python.exe")
+    create_application(
+        config_path=tmp_path / "config.toml",
+        executable=executable,
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.startup_command == (
+        f'"{executable}" "{(ROOT / "main.py").resolve()}" --startup'
+    )
+
+
+def test_exe_suffix_does_not_select_frozen_startup_mode(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    factories = RecordingFactories()
+    executable = tmp_path / "CatLocker.exe"
+    create_application(
+        config_path=tmp_path / "config.toml",
+        executable=executable,
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.startup_command == (
+        f'"{executable.resolve()}" "{(ROOT / "main.py").resolve()}" --startup'
+    )
+
+
+def test_source_mode_uses_existing_source_adjacent_portable_config(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_main = source_root / "main.py"
+    source_main.write_text("", encoding="utf-8")
+    (source_root / "catlocker.toml").write_text(
+        'toggle_hotkey = "K"\nnotifications = false\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys.modules["main"], "__file__", str(source_main))
+    factories = RecordingFactories()
+    create_application(
+        executable=tmp_path / "python" / "python.exe",
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.coordinator_settings == AppSettings("K", False)
+
+
+def test_source_mode_without_portable_config_uses_local_appdata(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source_main = source_root / "main.py"
+    source_main.write_text("", encoding="utf-8")
+    local_appdata = tmp_path / "local"
+    monkeypatch.setattr(sys.modules["main"], "__file__", str(source_main))
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+    factories = RecordingFactories()
+    create_application(
+        executable=tmp_path / "python" / "python.exe",
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.coordinator_settings == AppSettings()
+    assert (local_appdata / "CatLocker" / "config.toml").exists()
 
 
 def test_exit_unlocks_then_stops_hook_then_tray_then_tk():

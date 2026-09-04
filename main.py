@@ -430,8 +430,25 @@ def create_application(
         from tray import NativeTray
 
         frozen = bool(getattr(sys, "frozen", False))
-        executable_path = Path(executable) if executable is not None else Path(sys.executable)
-        script_path = None if frozen or executable_path.suffix.casefold() == ".exe" else Path(__file__).resolve()
+        executable_path = (
+            Path(executable) if executable is not None else Path(sys.executable)
+        )
+        application_root = (
+            executable_path.parent
+            if frozen
+            else Path(__file__).resolve().parent
+        )
+        if frozen:
+            startup_executable = executable_path
+            script_path = None
+        else:
+            sibling_pythonw = executable_path.parent / "pythonw.exe"
+            startup_executable = (
+                sibling_pythonw
+                if sibling_pythonw.is_file()
+                else executable_path.resolve()
+            )
+            script_path = Path(__file__).resolve()
         if config_path is None:
             local_appdata = Path(
                 os.environ.get(
@@ -440,7 +457,7 @@ def create_application(
                 )
             )
             current_config_path = resolve_config_path(
-                executable_path.parent,
+                application_root,
                 local_appdata,
             )
         else:
@@ -461,7 +478,10 @@ def create_application(
                 command_timeout=command_timeout,
             ),
         )(hook)
-        startup_command = build_startup_command(executable_path, script_path)
+        startup_command = build_startup_command(
+            startup_executable,
+            script_path,
+        )
         startup_registry = _factory(
             bundle,
             "startup_registry",

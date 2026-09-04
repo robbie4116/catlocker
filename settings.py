@@ -24,11 +24,15 @@ def build_startup_command(
     executable: Path | str,
     script: Path | str | None = None,
 ) -> str:
-    arguments = [str(executable)]
+    def quote_path(path: Path | str) -> str:
+        value = str(path).replace('"', '\\"')
+        return f'"{value}"'
+
+    arguments = [quote_path(executable)]
     if script is not None:
-        arguments.append(str(script))
+        arguments.append(quote_path(script))
     arguments.append("--startup")
-    return subprocess.list2cmdline(arguments)
+    return " ".join(arguments)
 
 
 class WindowsRegistryAdapter:
