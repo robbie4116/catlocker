@@ -28,6 +28,10 @@ class SettingsLocked(RuntimeError):
     """Raised when settings are changed while Cat Mode is locked."""
 
 
+class MalformedTkEvent(ValueError):
+    """Raised when a Tk event has no usable fallback keycode."""
+
+
 class WarningDeclined(RuntimeError):
     """Raised when the user declines a shortcut warning."""
 
@@ -68,7 +72,7 @@ def normalize_tk_event(event) -> int:
     try:
         keycode = int(getattr(event, "keycode"))
     except (AttributeError, TypeError, ValueError) as exc:
-        raise ValueError("Tk event must have a numeric keycode.") from exc
+        raise MalformedTkEvent("Tk event must have a numeric keycode.") from exc
     return _GENERIC_TK_KEYCODES_TO_VK.get(keycode, keycode)
 
 
@@ -479,7 +483,12 @@ class SettingsWindow:
             self._show_error(exc)
             return
         if accepted:
-            self._bind_recording_events()
+            try:
+                self._bind_recording_events()
+            except Exception as exc:
+                self._cleanup_recording_state()
+                self._show_error(exc)
+                return
             self.hotkey_entry.focus_set()
             self.hotkey_var.set(self.view.hotkey_text)
             self.status_var.set("Press one shortcut combination.")
@@ -546,7 +555,7 @@ class SettingsWindow:
     def _on_key_press(self, event) -> str:
         try:
             shortcut = self.view.on_key_press(event)
-        except ValueError:
+        except MalformedTkEvent:
             return "break"
         except EngineUnhealthy as exc:
             self._cleanup_recording_state()
@@ -566,7 +575,7 @@ class SettingsWindow:
     def _on_key_release(self, event) -> str:
         try:
             self.view.on_key_release(event)
-        except ValueError:
+        except MalformedTkEvent:
             return "break"
         except EngineUnhealthy as exc:
             self._cleanup_recording_state()
@@ -593,33 +602,23 @@ class SettingsWindow:
             self._cleanup_recording_state()
 
     def _bind_recording_events(self) -> None:
-        self._recording_bindings = [
-            (
-                self.hotkey_entry,
-                "<KeyPress>",
-                self.hotkey_entry.bind("<KeyPress>", self._on_key_press),
-            ),
-            (
-                self.window,
-                "<KeyPress>",
-                self.window.bind("<KeyPress>", self._on_key_press),
-            ),
-            (
-                self.hotkey_entry,
-                "<KeyRelease>",
-                self.hotkey_entry.bind("<KeyRelease>", self._on_key_release),
-            ),
-            (
-                self.window,
-                "<KeyRelease>",
-                self.window.bind("<KeyRelease>", self._on_key_release),
-            ),
-            (
-                self.hotkey_entry,
-                "<FocusOut>",
-                self.hotkey_entry.bind("<FocusOut>", self._on_focus_out),
-            ),
-        ]
+        if self._recording_bindings:
+            return
+
+        binding_specs = (
+            (self.hotkey_entry, "<KeyPress>", self._on_key_press),
+            (self.window, "<KeyPress>", self._on_key_press),
+            (self.hotkey_entry, "<KeyRelease>", self._on_key_release),
+            (self.window, "<KeyRelease>", self._on_key_release),
+            (self.hotkey_entry, "<FocusOut>", self._on_focus_out),
+        )
+        try:
+            for widget, sequence, callback in binding_specs:
+                binding_id = widget.bind(sequence, callback)
+                self._recording_bindings.append((widget, sequence, binding_id))
+        except Exception:
+            self._unbind_recording_events()
+            raise
 
     def _unbind_recording_events(self) -> None:
         for widget, sequence, binding_id in self._recording_bindings:

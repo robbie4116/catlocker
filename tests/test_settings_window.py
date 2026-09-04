@@ -460,8 +460,10 @@ def test_normalize_tk_event_passes_through_existing_virtual_key_values(keycode):
 def test_normalize_tk_event_rejects_invalid_fallback_keycodes(keycode):
     normalizer = getattr(settings_window_module, "normalize_tk_event")
 
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as exc_info:
         normalizer(FakeTkEvent(keycode, keysym=""))
+
+    assert type(exc_info.value).__name__ == "MalformedTkEvent"
 
 
 class FakeTkEvent:
@@ -1128,6 +1130,115 @@ def test_settings_window_malformed_event_is_ignored(monkeypatch):
         window.view.recording,
     ) == before_release
     assert window.view.recording is True
+
+
+def test_settings_window_controller_value_error_during_completion_is_routed(monkeypatch):
+    error = ValueError("completion failed")
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_error": error},
+    )
+    errors = []
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+    window._show_error = errors.append
+    window._record()
+
+    assert window._on_key_press(FakeTkEvent(0x4B, keysym="k")) == "break"
+
+    assert errors == [error]
+    assert window.hotkey_var.get() == "F24"
+    assert window.view.recording is False
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.record_button.configured["state"] == "normal"
+    assert window.save_button.configured["state"] == "normal"
+
+
+def test_settings_window_coordinator_value_error_during_release_is_routed(monkeypatch):
+    error = ValueError("release failed")
+    coordinator = make_coordinator([])
+    original_record_keyup = coordinator.record_keyup
+
+    def record_keyup(vk):
+        original_record_keyup(vk)
+        raise error
+
+    coordinator.record_keyup = record_keyup
+    errors = []
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+    window._show_error = errors.append
+    window._record()
+    window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    assert window._on_key_release(FakeTkEvent(0xFE, keysym="Shift_L")) == "break"
+
+    assert errors == [error]
+    assert window.hotkey_var.get() == "F24"
+    assert window.view.recording is False
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.record_button.configured["state"] == "normal"
+    assert window.save_button.configured["state"] == "normal"
+
+
+def test_settings_window_binding_is_idempotent(monkeypatch):
+    window = make_settings_window(monkeypatch)
+
+    window._bind_recording_events()
+    first_entry_bindings = dict(window.hotkey_entry.bindings)
+    first_window_bindings = dict(window.window.bindings)
+    first_recording_bindings = list(window._recording_bindings)
+
+    window._bind_recording_events()
+
+    assert window.hotkey_entry.bindings == first_entry_bindings
+    assert window.window.bindings == first_window_bindings
+    assert window._recording_bindings == first_recording_bindings
+
+
+def test_settings_window_binding_failure_removes_partial_bindings(monkeypatch):
+    error = RuntimeError("bind failed")
+    window = make_settings_window(monkeypatch)
+    original_bind = window.window.bind
+
+    def fail_on_second_bind(sequence, callback):
+        if sequence == "<KeyPress>":
+            raise error
+        return original_bind(sequence, callback)
+
+    monkeypatch.setattr(window.window, "bind", fail_on_second_bind)
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        window._bind_recording_events()
+
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window._recording_bindings == []
+
+
+def test_settings_window_record_binding_failure_cleans_up_and_shows_error(monkeypatch):
+    error = RuntimeError("bind failed")
+    window = make_settings_window(monkeypatch)
+    original_bind = window.window.bind
+
+    def fail_on_second_bind(sequence, callback):
+        if sequence == "<KeyPress>":
+            raise error
+        return original_bind(sequence, callback)
+
+    monkeypatch.setattr(window.window, "bind", fail_on_second_bind)
+    errors = []
+    window._show_error = errors.append
+
+    window._record()
+
+    assert errors == [error]
+    assert window.view.recording is False
+    assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.record_button.configured["state"] == "normal"
+    assert window.save_button.configured["state"] == "normal"
 
 
 def test_settings_window_cleanup(monkeypatch):
