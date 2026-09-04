@@ -35,6 +35,8 @@ Make Catlocker’s settings recorder reliably accept the existing modifier-plus-
 8. Cancel or closing the Settings window cancels an active recording and restores the last accepted shortcut. The title-bar close protocol is intentionally equivalent to Cancel: it also discards a completed-but-unsaved candidate and restores the last accepted shortcut. Focus loss has the same effect only while recording is active. After a valid trigger completes recording, ordinary focus loss does not discard the completed candidate; the candidate remains visible until Save or Cancel/close.
 9. Unsupported keys and combinations containing more than one non-modifier remain unaccepted while capture continues. The preview shows recognized held key names and deterministic `VK_XX` labels for unknown virtual keys; these values cannot be saved. Existing validation and system-shortcut warning behavior remain unchanged.
 
+Starting a new recording while a completed-but-unsaved candidate is visible intentionally replaces that candidate: the field is cleared, the new recording becomes the active draft, and Cancel/close restores the last saved shortcut rather than the replaced candidate.
+
 During active recording the Entry remains focusable for keyboard event delivery, but the temporary Entry-level and Settings-window-level key handlers both return Tk's `"break"` result for every captured key press and release. The Entry-level binding handles the earlier binding tag in Tk's dispatch order; the window-level binding covers events delivered while another child has focus. The Entry's normal text insertion never runs; the field is updated only through the recording state.
 
 ### Shortcut contract
@@ -61,7 +63,7 @@ The current module boundaries remain in place:
 - `SettingsWindow` will bind temporary `<KeyPress>` and `<KeyRelease>` handlers to both the shortcut Entry and the `Toplevel`, bind `<FocusOut>` to the shortcut entry, focus the entry when recording starts, and synchronize Tk variables and control state. The permanent `WM_DELETE_WINDOW` protocol remains installed independently of temporary recording bindings.
 - `main.py`, `controller.py`, and startup persistence remain unchanged.
 
-Tk modifier events will be normalized before entering the coordinator by `normalize_tk_event(event) -> int`. The helper reads `event.keysym` first for known modifier names and falls back to `int(event.keycode)`. Keysym matching has precedence over generic keycodes. The exact modifier table is:
+Tk modifier events will be normalized before entering the coordinator by `normalize_tk_event(event) -> int`. The helper reads `event.keysym` first for known modifier names and falls back to `int(event.keycode)` only when the keysym is absent or unrecognized. Keysym matching has precedence over generic keycodes. The exact modifier table is:
 
 | Tk keysym(s) | Virtual key passed to the coordinator |
 | --- | --- |
@@ -69,8 +71,9 @@ Tk modifier events will be normalized before entering the coordinator by `normal
 | `Control_L`, `Control_R` | `VK_LCONTROL`, `VK_RCONTROL` |
 | `Alt_L`, `Alt_R` | `VK_LMENU`, `VK_RMENU` |
 | `Win_L`, `Win_R`, `Super_L`, `Super_R`, `Meta_L`, `Meta_R` | `VK_LWIN`, `VK_RWIN` |
+| bare `Shift`, `Control`, `Ctrl`, `Alt`, `Win`, `Super`, `Meta` | representative left-side value: `VK_LSHIFT`, `VK_LCONTROL`, `VK_LMENU`, or `VK_LWIN` |
 
-Keysym matching is case-insensitive after trimming. When a keysym is not one of the known aliases, generic Tk modifier keycodes `0x10`, `0x11`, and `0x12` map to `VK_LSHIFT`, `VK_LCONTROL`, and `VK_LMENU` respectively. Existing left/right virtual-key values pass through unchanged; Windows-key keycodes `0x5B` and `0x5C` also pass through unchanged. The same normalization function is used for keydown and keyup, so the value removed on release is the value added on press. Trigger keycodes continue to use the existing Windows virtual-key mapping. A missing/non-numeric `keycode` raises `ValueError` from the helper and is treated as an unrecordable event rather than persisted input. The window handlers catch this `ValueError`, leave the held-key state and display unchanged, return `"break"`, and keep recording active so the user can try another key.
+Keysym matching is case-insensitive after trimming. A recognized keysym is sufficient even if `event.keycode` is missing or malformed. When the keysym is absent or unrecognized, generic Tk modifier keycodes `0x10`, `0x11`, and `0x12` map to `VK_LSHIFT`, `VK_LCONTROL`, and `VK_LMENU` respectively. Existing left/right virtual-key values pass through unchanged; Windows-key keycodes `0x5B` and `0x5C` also pass through unchanged. The same normalization function is used for keydown and keyup, so the value removed on release is the value added on press. Trigger keycodes continue to use the existing Windows virtual-key mapping. A missing or non-`int`-convertible fallback `keycode` raises `ValueError` from the helper and is treated as an unrecordable event rather than persisted input. The window handlers catch this `ValueError`, leave the held-key state and display unchanged, return `"break"`, and keep recording active so the user can try another key.
 
 The coordinator’s `recording_text` formatter will use the existing modifier order and key-name table. It will display one family name for each active modifier family, so pressing left and right Control displays only `Ctrl`, followed by recognized non-modifier names sorted by ascending virtual-key value. Unknown non-modifiers use `VK_XX` with a two-digit uppercase hexadecimal virtual-key value (or the full uppercase hexadecimal value when larger than `0xFF`). A valid one-trigger state produces the same canonical text used by `Shortcut.canonical`; an incomplete or invalid state remains a preview only and cannot be saved. If an invalid state becomes valid only after releasing an extra key, the preview updates but recording does not complete until the user presses a valid trigger keydown again.
 
@@ -80,6 +83,7 @@ The coordinator’s `recording_text` formatter will use the existing modifier or
 - If the recorder loses focus, its temporary bindings are removed, the controller exits recording mode, and the accepted shortcut is restored. A `False` result from `exit_recording()` still clears local state and removes bindings without being treated as a fatal error; an `EngineUnhealthy` exception performs the same cleanup and is routed through the fatal callback.
 - If the user cancels after a partial preview, the partial value is never persisted.
 - If `exit_recording()` raises `EngineUnhealthy` during focus loss, close, or lock transition, the existing path clears local recording state in its `finally` cleanup, removes the temporary bindings, restores the accepted display, and routes the engine failure through the existing fatal callback. The UI must not leave recording controls active after this failure. Other unexpected exceptions are caught by the Settings handler, reported with `_show_error`, and handled after the same local/binding cleanup; focus-loss cleanup leaves the window open, while close cleanup still withdraws the window. In every case `_sync_controls()` runs after cleanup.
+- If `end_recording()` raises during completion after a valid trigger keydown, the returned shortcut is not applied: the view restores `_accepted_hotkey`, marks recording inactive, and the window removes temporary bindings and synchronizes controls. `EngineUnhealthy` is routed through the fatal callback; another exception is shown with `_show_error` while the Settings window remains open. If `end_recording()` returns `False`, local cleanup still completes and the valid returned shortcut remains the draft because no engine-health exception occurred.
 - The existing `SettingsCoordinator.save()` validation, persistence rollback, and controller replacement flow remains the single path for applying a shortcut.
 - Temporary recording bindings are removed after completion, cancellation, focus loss, lock transition, and window close. The permanent close protocol remains installed so the Settings window can be reused.
 
@@ -92,6 +96,7 @@ Add failing tests before implementation, then use focused red-green cycles:
 - `tests/test_settings_window.py` window coverage proving recording focuses the entry, binds temporary handlers to both the Entry and Settings window, returns `"break"` to prevent Entry insertion, and removes every temporary binding on completion, cancellation, focus loss, lock transition, and controller-exit failure.
 - Normalization/formatting coverage will assert keysym precedence, left/right and generic modifier aliases, matching keyup normalization, duplicate modifier-family display, unknown `VK_XX` display, and the rule that releasing an extra key does not complete a recording.
 - Failure-path coverage will distinguish a benign `False` controller response from `EngineUnhealthy`, asserting cleanup, display restoration, control synchronization, and fatal routing as appropriate. It will also cover malformed Tk events, key-release `"break"` behavior, window-level dispatch when another child has focus, and title-bar close after a completed-but-unsaved capture.
+- Additional coverage will assert bare modifier keysyms, recognized-keysym precedence over malformed keycodes, starting a new recording over an unsaved candidate, and completion-path `end_recording()` failures.
 
 The key state transitions are:
 
@@ -102,8 +107,10 @@ The key state transitions are:
 | Active/invalid | Unknown or extra non-modifier keydown | Deterministic preview; remain active; Save disabled |
 | Active/partial | Focus loss, Cancel, or close | Exit recording, restore accepted field, remove bindings |
 | Active/partial | Valid trigger keydown | Return `Shortcut`, exit recording, set field to `Shortcut.canonical`, Save enabled |
+| Active/partial | Completion exit failure | Clear active state, restore accepted field, remove bindings; fatal callback for `EngineUnhealthy`, ordinary error dialog otherwise |
 | Completed/unsaved | Focus loss | Keep candidate visible |
 | Completed/unsaved | Cancel or close | Restore accepted field |
+| Completed/unsaved | Begin recording | Replace candidate with a blank active draft |
 | Completed/unsaved | Save | Validate/persist through existing save flow; accepted baseline becomes new shortcut |
 | Any active state | Lock transition | Exit recording, restore accepted field, remove bindings, disable/withdraw as existing lock flow requires |
 | Any active state | `EngineUnhealthy` | Clear local state, remove bindings, synchronize controls, route fatal callback |
