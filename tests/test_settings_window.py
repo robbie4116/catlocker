@@ -34,6 +34,7 @@ class FakeController:
         rollback_result=_UNSET,
         enter_recording_result: bool = True,
         enter_recording_error: BaseException | None = None,
+        exit_recording_result: bool = True,
         exit_recording_error: BaseException | None = None,
     ):
         self.calls = calls
@@ -43,6 +44,7 @@ class FakeController:
         self.rollback_result = rollback_result
         self.enter_recording_result = enter_recording_result
         self.enter_recording_error = enter_recording_error
+        self.exit_recording_result = exit_recording_result
         self.exit_recording_error = exit_recording_error
         self.replace_count = 0
         self.fail_open_calls = 0
@@ -66,7 +68,7 @@ class FakeController:
         self.calls.append(("exit_recording", None))
         if self.exit_recording_error is not None:
             raise self.exit_recording_error
-        return True
+        return self.exit_recording_result
 
     def enter_fail_open(self):
         self.fail_open_calls += 1
@@ -473,6 +475,7 @@ class FakeTkWidget:
         self.configured = {}
         self.bindings = {}
         self._next_binding = 1
+        self.focus_set_calls = 0
 
     def pack(self, *args, **kwargs):
         return None
@@ -502,18 +505,32 @@ class FakeTkWidget:
             self.bindings.pop((sequence, binding_id), None)
 
     def focus_set(self):
+        self.focus_set_calls += 1
         return None
 
 
 class FakeTkVariable:
     def __init__(self, master=None, value=None):
         self.value = value
+        self.set_calls = []
 
     def get(self):
         return self.value
 
     def set(self, value):
+        self.set_calls.append(value)
         self.value = value
+
+
+def dispatch_child_event(child, parent, sequence, event):
+    for (bound_sequence, _binding_id), callback in child.bindings.items():
+        if bound_sequence == sequence:
+            if callback(event) == "break":
+                return "break"
+    for (bound_sequence, _binding_id), callback in parent.bindings.items():
+        if bound_sequence == sequence:
+            return callback(event)
+    return None
 
 
 class FakeTkToplevel(FakeTkWidget):
@@ -598,6 +615,118 @@ def test_view_record_display_changes_only_after_coordinator_acceptance():
     assert view.begin_recording() is True
     assert view.recording is True
     assert view.record_label == "Press a shortcut..."
+
+
+def test_view_begin_recording_clears_display():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+    view.hotkey_text = "Ctrl+K"
+
+    assert view.begin_recording() is True
+    assert view.hotkey_text == ""
+
+    rejected = make_coordinator(
+        [],
+        controller_options={"enter_recording_result": False},
+    )
+    rejected_view = SettingsViewModel(rejected)
+    rejected_view.hotkey_text = "Ctrl+K"
+
+    assert rejected_view.begin_recording() is False
+    assert rejected_view.hotkey_text == "Ctrl+K"
+
+
+def test_view_updates_live_preview():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+
+    assert view.begin_recording() is True
+    assert view.hotkey_text == ""
+    view.on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+    assert view.hotkey_text == "Ctrl"
+    view.on_key_press(FakeTkEvent(0xFF, keysym="Shift_L"))
+    assert view.hotkey_text == "Ctrl+Shift"
+    view.on_key_release(FakeTkEvent(0xFE, keysym="Shift_L"))
+    assert view.hotkey_text == "Ctrl"
+    view.on_key_press(FakeTkEvent(0x4B, keysym="k"))
+
+    assert view.hotkey_text == "Ctrl+K"
+    assert view.recording is False
+
+
+def test_view_save_is_disabled_during_partial_recording():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+
+    assert view.save_enabled is True
+    view.begin_recording()
+    view.on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    assert view.save_enabled is False
+
+    view.on_key_press(FakeTkEvent(0x4B, keysym="k"))
+    assert view.save_enabled is True
+
+
+def test_view_new_recording_replaces_unsaved_candidate():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+
+    view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x4B, keysym="k"))
+    assert view.hotkey_text == "K"
+
+    view.begin_recording()
+    assert view.hotkey_text == ""
+    view.cancel_recording()
+
+    assert view.hotkey_text == "F24"
+
+
+def test_view_cancel_restores_accepted():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+
+    view.begin_recording()
+    view.on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+    assert view.hotkey_text == "Ctrl"
+
+    view.cancel_recording()
+
+    assert view.hotkey_text == "F24"
+    assert view.recording is False
+
+
+def test_view_false_exit_preserves_draft():
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_result": False},
+    )
+    view = SettingsViewModel(coordinator)
+
+    view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x4B, keysym="k"))
+
+    assert view.hotkey_text == "K"
+    assert view.recording is False
+
+
+@pytest.mark.parametrize("completion_error", [EngineUnhealthy("stalled"), OSError("failed")])
+def test_view_completion_failure_restores_accepted(completion_error):
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_error": completion_error},
+    )
+    view = SettingsViewModel(coordinator)
+    view.hotkey_text = "Ctrl+K"
+    view._accepted_hotkey = "F24"
+    view.begin_recording()
+
+    with pytest.raises(type(completion_error), match=str(completion_error)):
+        view.on_key_press(FakeTkEvent(0x4B, keysym="k"))
+
+    assert view.hotkey_text == "F24"
+    assert view.recording is False
 
 
 def test_view_forwards_windows_numeric_keycode_as_vk():
@@ -810,3 +939,370 @@ def test_settings_startup_unknown_state_preserves_value(monkeypatch):
     assert results == [StartupUpdateResult(None, error)]
     assert window.view.startup_enabled is False
     assert window.startup_var.get() is False
+
+
+def test_settings_window_recording_focuses_entry_and_binds_both(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window.hotkey_var.set_calls.clear()
+
+    window._record()
+
+    assert window.hotkey_entry.focus_set_calls == 1
+    assert window.hotkey_var.get() == ""
+    assert "" in window.hotkey_var.set_calls
+    assert {sequence for sequence, _ in window.hotkey_entry.bindings} == {
+        "<KeyPress>",
+        "<KeyRelease>",
+        "<FocusOut>",
+    }
+    assert {sequence for sequence, _ in window.window.bindings} == {
+        "<KeyPress>",
+        "<KeyRelease>",
+    }
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+
+
+def test_settings_window_rejected_recording_preserves_value_and_bindings(monkeypatch):
+    coordinator = make_coordinator(
+        [],
+        controller_options={"enter_recording_result": False},
+    )
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+    window.hotkey_var.set("Ctrl+K")
+    window.hotkey_var.set_calls.clear()
+
+    window._record()
+
+    assert window.hotkey_var.get() == "Ctrl+K"
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.hotkey_entry.focus_set_calls == 0
+    assert window.hotkey_var.set_calls == []
+
+
+def test_settings_window_dispatch(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    calls = []
+    original = window.view.on_key_press
+
+    def on_key_press(event):
+        calls.append(event)
+        return original(event)
+
+    window.view.on_key_press = on_key_press
+    window._record()
+
+    entry_result = dispatch_child_event(
+        window.hotkey_entry,
+        window.window,
+        "<KeyPress>",
+        FakeTkEvent(0xFF, keysym="Control_L"),
+    )
+    other_child_result = dispatch_child_event(
+        FakeTkWidget(),
+        window.window,
+        "<KeyPress>",
+        FakeTkEvent(0xFE, keysym="Shift_L"),
+    )
+
+    assert entry_result == "break"
+    assert other_child_result == "break"
+    assert len(calls) == 2
+    assert window.view.hotkey_text == "Ctrl+Shift"
+
+
+def test_settings_window_handlers_return_break_and_synchronize(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window._record()
+    window.hotkey_var.set_calls.clear()
+
+    assert (
+        dispatch_child_event(
+            window.hotkey_entry,
+            window.window,
+            "<KeyPress>",
+            FakeTkEvent(0xFF, keysym="Control_L"),
+        )
+        == "break"
+    )
+    assert (
+        dispatch_child_event(
+            FakeTkWidget(),
+            window.window,
+            "<KeyPress>",
+            FakeTkEvent(0xFF, keysym="Shift_L"),
+        )
+        == "break"
+    )
+    assert (
+        dispatch_child_event(
+            FakeTkWidget(),
+            window.window,
+            "<KeyRelease>",
+            FakeTkEvent(0xFE, keysym="Shift_L"),
+        )
+        == "break"
+    )
+    assert (
+        dispatch_child_event(
+            window.hotkey_entry,
+            window.window,
+            "<KeyPress>",
+            FakeTkEvent(0x4B, keysym="k"),
+        )
+        == "break"
+    )
+
+    assert window.hotkey_var.set_calls == ["Ctrl", "Ctrl+Shift", "Ctrl", "Ctrl+K"]
+    assert window.hotkey_var.get() == "Ctrl+K"
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.save_button.configured["state"] == "normal"
+
+
+def test_settings_window_focus_loss_cancels_active_recording(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window.show()
+    window._record()
+    window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    window._on_focus_out()
+
+    assert window.view.recording is False
+    assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.window.withdrawn is False
+    assert window.record_button.configured["state"] == "normal"
+    assert window.save_button.configured["state"] == "normal"
+
+
+def test_settings_window_close_discards_unsaved_candidate(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window.show()
+    window._record()
+    window._on_key_press(FakeTkEvent(0x4B, keysym="k"))
+    assert window.hotkey_var.get() == "K"
+
+    window._on_focus_out()
+    assert window.hotkey_var.get() == "K"
+
+    window._close()
+
+    assert window.hotkey_var.get() == "F24"
+    assert window.window.withdrawn is True
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+
+
+def test_settings_window_malformed_event_is_ignored(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window._record()
+    window.hotkey_var.set_calls.clear()
+
+    before_press = (
+        window.view.hotkey_text,
+        window.hotkey_var.get(),
+        window.view.recording,
+        dict(window.hotkey_entry.bindings),
+        dict(window.window.bindings),
+    )
+    assert window._on_key_press(FakeTkEvent(None, keysym="")) == "break"
+    assert (
+        window.view.hotkey_text,
+        window.hotkey_var.get(),
+        window.view.recording,
+        dict(window.hotkey_entry.bindings),
+        dict(window.window.bindings),
+    ) == before_press
+
+    assert window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L")) == "break"
+    before_release = (
+        window.view.hotkey_text,
+        window.hotkey_var.get(),
+        window.view.recording,
+    )
+    assert window._on_key_release(FakeTkEvent("bad", keysym="")) == "break"
+    assert (
+        window.view.hotkey_text,
+        window.hotkey_var.get(),
+        window.view.recording,
+    ) == before_release
+    assert window.view.recording is True
+
+
+def test_settings_window_cleanup(monkeypatch):
+    completed = make_settings_window(monkeypatch)
+    completed._record()
+    completed._on_key_press(FakeTkEvent(0x4B, keysym="k"))
+    assert completed.hotkey_var.get() == "K"
+    assert completed.hotkey_entry.bindings == {}
+    assert completed.window.bindings == {}
+    assert completed.record_button.configured["state"] == "normal"
+    assert completed.save_button.configured["state"] == "normal"
+
+    focused = make_settings_window(monkeypatch)
+    focused.show()
+    focused._record()
+    focused._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+    focused._on_focus_out()
+    assert focused.hotkey_var.get() == "F24"
+    assert focused.hotkey_entry.bindings == {}
+    assert focused.window.bindings == {}
+    assert focused.window.withdrawn is False
+
+    locked = make_settings_window(monkeypatch)
+    locked.show()
+    locked._record()
+    locked._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+    locked.on_lock_state(True)
+    assert locked.hotkey_var.get() == "F24"
+    assert locked.hotkey_entry.bindings == {}
+    assert locked.window.bindings == {}
+    assert locked.window.withdrawn is True
+    assert locked.record_button.configured["state"] == "disabled"
+    assert locked.save_button.configured["state"] == "disabled"
+
+    closed = make_settings_window(monkeypatch)
+    closed._record()
+    closed._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+    closed._close()
+    assert closed.hotkey_var.get() == "F24"
+    assert closed.hotkey_entry.bindings == {}
+    assert closed.window.bindings == {}
+    assert closed.window.withdrawn is True
+
+
+def test_settings_window_false_exit(monkeypatch):
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_result": False},
+    )
+    fatal_errors = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_engine_unhealthy=fatal_errors.append,
+    )
+    window._record()
+
+    assert window._on_key_press(FakeTkEvent(0x4B, keysym="k")) == "break"
+
+    assert fatal_errors == []
+    assert window.hotkey_var.get() == "K"
+    assert window.view.recording is False
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+
+
+@pytest.mark.parametrize("error_kind", ["engine", "ordinary"])
+def test_settings_window_engine_unhealthy_and_ordinary_exception(monkeypatch, error_kind):
+    error = EngineUnhealthy("stalled") if error_kind == "engine" else OSError("failed")
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_error": error},
+    )
+    fatal_errors = []
+    ordinary_errors = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_engine_unhealthy=fatal_errors.append,
+    )
+    window._show_error = ordinary_errors.append
+    window._record()
+
+    assert window._on_key_press(FakeTkEvent(0x4B, keysym="k")) == "break"
+
+    assert window.hotkey_var.get() == "F24"
+    assert window.view.recording is False
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+    if error_kind == "engine":
+        assert fatal_errors == [error]
+        assert ordinary_errors == []
+    else:
+        assert fatal_errors == []
+        assert ordinary_errors == [error]
+
+
+def test_settings_window_lock_ordinary_exception(monkeypatch):
+    error = OSError("failed")
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_error": error},
+    )
+    errors = []
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+    window._show_error = errors.append
+    window._record()
+    window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    window.on_lock_state(True)
+
+    assert errors == [error]
+    assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.window.withdrawn is True
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+    assert window.record_button.configured["state"] == "disabled"
+
+
+def test_settings_window_lock_engine_unhealthy(monkeypatch):
+    error = EngineUnhealthy("stalled")
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_error": error},
+    )
+    fatal_errors = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_engine_unhealthy=fatal_errors.append,
+    )
+    window._record()
+    window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    window.on_lock_state(True)
+
+    assert fatal_errors == [error]
+    assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.window.withdrawn is True
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+
+
+@pytest.mark.parametrize("error_kind", ["ordinary", "engine"])
+def test_settings_window_close_failure_restores_and_withdraws(monkeypatch, error_kind):
+    error = EngineUnhealthy("stalled") if error_kind == "engine" else OSError("failed")
+    coordinator = make_coordinator(
+        [],
+        controller_options={"exit_recording_error": error},
+    )
+    fatal_errors = []
+    ordinary_errors = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_engine_unhealthy=fatal_errors.append,
+    )
+    window._show_error = ordinary_errors.append
+    window._record()
+    window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    window._close()
+
+    assert window.hotkey_var.get() == "F24"
+    assert window.view.recording is False
+    assert window.hotkey_entry.bindings == {}
+    assert window.window.bindings == {}
+    assert window.window.withdrawn is True
+    assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
+    if error_kind == "engine":
+        assert fatal_errors == [error]
+        assert ordinary_errors == []
+    else:
+        assert fatal_errors == []
+        assert ordinary_errors == [error]

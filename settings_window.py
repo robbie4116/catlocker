@@ -264,7 +264,7 @@ class SettingsViewModel:
 
     @property
     def save_enabled(self) -> bool:
-        return not self.locked
+        return not self.locked and not self.recording
 
     def begin_recording(self) -> bool:
         if self.locked:
@@ -277,17 +277,21 @@ class SettingsViewModel:
         if not accepted:
             return False
         self._recording = True
+        self.hotkey_text = ""
         return True
 
     def on_key_press(self, event) -> Shortcut | None:
         if not self._recording:
             return None
+        vk = normalize_tk_event(event)
         try:
-            shortcut = self.coordinator.record_keydown(int(event.keycode))
-        except EngineUnhealthy:
+            shortcut = self.coordinator.record_keydown(vk)
+        except Exception:
+            self.hotkey_text = self._accepted_hotkey
             self._recording = False
             raise
         if shortcut is None:
+            self.hotkey_text = self.coordinator.recording_text
             return None
         self.hotkey_text = shortcut.canonical
         self._recording = False
@@ -295,7 +299,9 @@ class SettingsViewModel:
 
     def on_key_release(self, event) -> None:
         if self._recording:
-            self.coordinator.record_keyup(int(event.keycode))
+            vk = normalize_tk_event(event)
+            self.coordinator.record_keyup(vk)
+            self.hotkey_text = self.coordinator.recording_text
 
     def cancel_recording(self) -> None:
         if not self._recording and not self.coordinator.recording:
@@ -304,14 +310,17 @@ class SettingsViewModel:
             self.coordinator.end_recording()
         finally:
             self._recording = False
+            self.hotkey_text = self._accepted_hotkey
 
     def on_focus_out(self, _event=None) -> None:
         self.cancel_recording()
 
     def on_close(self) -> None:
-        self.cancel_recording()
-        self.hotkey_text = self._accepted_hotkey
-        self.notifications = self.coordinator.current.notifications
+        try:
+            self.cancel_recording()
+        finally:
+            self.hotkey_text = self._accepted_hotkey
+            self.notifications = self.coordinator.current.notifications
 
     def save(
         self,
@@ -436,16 +445,23 @@ class SettingsWindow:
         self.hotkey_entry.focus_set()
 
     def on_lock_state(self, locked: bool) -> None:
+        error: BaseException | None = None
         try:
-            try:
-                self.view.on_lock_state(locked)
-            except EngineUnhealthy as exc:
-                self._handle_engine_unhealthy(exc)
+            self.view.on_lock_state(locked)
+        except EngineUnhealthy as exc:
+            error = exc
+        except Exception as exc:
+            error = exc
         finally:
             self._unbind_recording_events()
+            self.hotkey_var.set(self.view.hotkey_text)
             self._sync_controls()
             if locked:
                 self.window.withdraw()
+        if isinstance(error, EngineUnhealthy):
+            self._handle_engine_unhealthy(error)
+        elif error is not None:
+            self._show_error(error)
 
     def on_startup_state(self, enabled: bool) -> None:
         self.view.startup_enabled = bool(enabled)
@@ -455,10 +471,17 @@ class SettingsWindow:
         try:
             accepted = self.view.begin_recording()
         except EngineUnhealthy as exc:
+            self._sync_controls()
             self._handle_engine_unhealthy(exc)
+            return
+        except Exception as exc:
+            self._sync_controls()
+            self._show_error(exc)
             return
         if accepted:
             self._bind_recording_events()
+            self.hotkey_entry.focus_set()
+            self.hotkey_var.set(self.view.hotkey_text)
             self.status_var.set("Press one shortcut combination.")
         self._sync_controls()
 
@@ -503,40 +526,71 @@ class SettingsWindow:
             self._show_error(result.error)
 
     def _close(self) -> None:
+        error: BaseException | None = None
         try:
             self.view.on_close()
         except EngineUnhealthy as exc:
-            self._handle_engine_unhealthy(exc)
-            return
-        self._unbind_recording_events()
-        self.window.withdraw()
+            error = exc
+        except Exception as exc:
+            error = exc
+        finally:
+            self._unbind_recording_events()
+            self.hotkey_var.set(self.view.hotkey_text)
+            self._sync_controls()
+            self.window.withdraw()
+        if isinstance(error, EngineUnhealthy):
+            self._handle_engine_unhealthy(error)
+        elif error is not None:
+            self._show_error(error)
 
     def _on_key_press(self, event) -> str:
         try:
             shortcut = self.view.on_key_press(event)
+        except ValueError:
+            return "break"
         except EngineUnhealthy as exc:
+            self._cleanup_recording_state()
             self._handle_engine_unhealthy(exc)
-            self._unbind_recording_events()
-            self._sync_controls()
-            return
+            return "break"
+        except Exception as exc:
+            self._cleanup_recording_state()
+            self._show_error(exc)
+            return "break"
+        self.hotkey_var.set(self.view.hotkey_text)
         if shortcut is not None:
-            self.hotkey_var.set(self.view.hotkey_text)
             self.status_var.set("Shortcut captured. Save to apply it.")
             self._unbind_recording_events()
-            self._sync_controls()
+        self._sync_controls()
         return "break"
 
-    def _on_key_release(self, event) -> None:
-        self.view.on_key_release(event)
+    def _on_key_release(self, event) -> str:
+        try:
+            self.view.on_key_release(event)
+        except ValueError:
+            return "break"
+        except EngineUnhealthy as exc:
+            self._cleanup_recording_state()
+            self._handle_engine_unhealthy(exc)
+            return "break"
+        except Exception as exc:
+            self._cleanup_recording_state()
+            self._show_error(exc)
+            return "break"
+        self.hotkey_var.set(self.view.hotkey_text)
+        self._sync_controls()
+        return "break"
 
     def _on_focus_out(self, _event=None) -> None:
         try:
             self.view.on_focus_out()
         except EngineUnhealthy as exc:
+            self._cleanup_recording_state()
             self._handle_engine_unhealthy(exc)
-        finally:
-            self._unbind_recording_events()
-            self._sync_controls()
+        except Exception as exc:
+            self._cleanup_recording_state()
+            self._show_error(exc)
+        else:
+            self._cleanup_recording_state()
 
     def _bind_recording_events(self) -> None:
         self._recording_bindings = [
@@ -546,9 +600,19 @@ class SettingsWindow:
                 self.hotkey_entry.bind("<KeyPress>", self._on_key_press),
             ),
             (
+                self.window,
+                "<KeyPress>",
+                self.window.bind("<KeyPress>", self._on_key_press),
+            ),
+            (
                 self.hotkey_entry,
                 "<KeyRelease>",
                 self.hotkey_entry.bind("<KeyRelease>", self._on_key_release),
+            ),
+            (
+                self.window,
+                "<KeyRelease>",
+                self.window.bind("<KeyRelease>", self._on_key_release),
             ),
             (
                 self.hotkey_entry,
@@ -556,12 +620,20 @@ class SettingsWindow:
                 self.hotkey_entry.bind("<FocusOut>", self._on_focus_out),
             ),
         ]
-        self.window.protocol("WM_DELETE_WINDOW", self._close)
 
     def _unbind_recording_events(self) -> None:
         for widget, sequence, binding_id in self._recording_bindings:
             widget.unbind(sequence, binding_id)
         self._recording_bindings.clear()
+
+    def _cleanup_recording_state(self) -> None:
+        try:
+            self.view.cancel_recording()
+        except Exception:
+            pass
+        self._unbind_recording_events()
+        self.hotkey_var.set(self.view.hotkey_text)
+        self._sync_controls()
 
     def _handle_engine_unhealthy(self, error: EngineUnhealthy) -> None:
         if self._on_engine_unhealthy is not None:
