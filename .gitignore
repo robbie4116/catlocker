@@ -6,4 +6,7 @@ __pycache__/
 *-log-*.txt
 *.config
 *.spec
-keylock.toml
+catlocker.toml
+*.corrupt
+*.corrupt.*
+*.tmp

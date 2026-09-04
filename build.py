@@ -1,14 +1,18 @@
 import subprocess
+import sys
 
-subprocess.run([
-    "pyinstaller",
-    "--name=keylock",
-    "--onefile",
-    "--strip",
-    "--paths=env/Lib/site-packages",
-    "--add-data=assets:assets",
-    "--noconsole",
-    "--icon=assets/icon.ico",
-    "--exclude-module=numpy",
-    "main.py"
-])
+
+subprocess.run(
+    [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--name=CatLocker",
+        "--onefile",
+        "--noconsole",
+        "--icon=assets/icon.ico",
+        "--add-data=assets/icon.ico;assets",
+        "main.py",
+    ],
+    check=True,
+)

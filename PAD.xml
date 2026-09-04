@@ -1,13 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <pad>
     <application>
-        <name>Keylock</name>
+        <name>CatLocker</name>
         <version>v1.0.0</version>
         <url>https://github.com/Axorax/keylock</url>
-        <exe_file>https://github.com/Axorax/keylock/releases/download/v1.0.0/keylock.exe</exe_file>
-        <description>Lock your keys with ease</description>
+        <exe_file>https://github.com/Axorax/keylock/releases/download/v1.0.0/CatLocker.exe</exe_file>
+        <description>Lock your keyboard with CatLocker</description>
         <long_description>
-            Keylock is an app with a modern and beautiful UI that allows you to lock your keyboard. You can unlock it by pressing a shortcut that you can also change.
+            CatLocker is a Windows 11 keyboard lock utility with a native low-level keyboard hook, a configurable emergency unlock shortcut, and mouse-accessible tray controls.
         </long_description>
         <category>System Utility</category>
         <platform>Windows</platform>
@@ -23,7 +23,7 @@
             <feature>Modern and beautiful interface.</feature>
             <feature>Low RAM usage and file size.</feature>
         </features>
-        <keywords>keyboards, mouse-lock, keylock, keyboard-lock</keywords>
+        <keywords>keyboard, keyboard-lock, CatLocker, Windows 11</keywords>
         <screenshots>
             <screenshot>https://raw.githubusercontent.com/Axorax/keylock/refs/heads/main/thumbnail.png</screenshot>
         </screenshots>

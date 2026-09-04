@@ -16,10 +16,13 @@ DEFAULT_COMMAND_TIMEOUT = 1.0
 DEFAULT_THREAD_TIMEOUT = 1.0
 
 
+def resource_path(relative: str | os.PathLike[str]) -> Path:
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    return base / relative
+
+
 def load_asset(path):
-    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
-    assets = os.path.join(base, "assets")
-    return os.path.join(assets, path)
+    return str(resource_path(Path("assets") / path))
 
 
 def _finite_timeout(value: float, operation: str) -> float:

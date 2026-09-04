@@ -1,12 +1,10 @@
 @echo off
 
-pyinstaller ^
-    --name="keylock" ^
+py -m PyInstaller ^
+    --name=CatLocker ^
     --onefile ^
-    --strip ^
-    --paths=env\Lib\site-packages ^
-    --add-data="assets;assets" ^
     --noconsole ^
     --icon=assets/icon.ico ^
-    --exclude-module numpy ^
+    --add-data="assets/icon.ico;assets" ^
     main.py
+if errorlevel 1 exit /b %errorlevel%
