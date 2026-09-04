@@ -436,7 +436,17 @@ def test_normalize_tk_event_normalizes_keysym_and_passes_through_triggers(
 
 @pytest.mark.parametrize(
     "keycode",
-    [hotkeys.VK_LCONTROL, hotkeys.VK_RCONTROL, hotkeys.VK_LWIN, hotkeys.VK_RWIN, 0x4B],
+    [
+        hotkeys.VK_LCONTROL,
+        hotkeys.VK_RCONTROL,
+        hotkeys.VK_LSHIFT,
+        hotkeys.VK_RSHIFT,
+        hotkeys.VK_LMENU,
+        hotkeys.VK_RMENU,
+        hotkeys.VK_LWIN,
+        hotkeys.VK_RWIN,
+        0x4B,
+    ],
 )
 def test_normalize_tk_event_passes_through_existing_virtual_key_values(keycode):
     normalizer = getattr(settings_window_module, "normalize_tk_event")
