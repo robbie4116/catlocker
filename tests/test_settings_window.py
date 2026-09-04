@@ -474,10 +474,11 @@ class FakeTkEvent:
 
 class FakeTkWidget:
     def __init__(self, *args, **kwargs):
-        self.configured = {}
+        self.configured = dict(kwargs)
         self.bindings = {}
         self._next_binding = 1
         self.focus_set_calls = 0
+        self.textvariable = kwargs.get("textvariable")
 
     def pack(self, *args, **kwargs):
         return None
@@ -487,6 +488,8 @@ class FakeTkWidget:
 
     def configure(self, **kwargs):
         self.configured.update(kwargs)
+        if "textvariable" in kwargs:
+            self.textvariable = kwargs["textvariable"]
 
     config = configure
 
@@ -510,6 +513,18 @@ class FakeTkWidget:
         self.focus_set_calls += 1
         return None
 
+    def _apply_default_class_binding(self, sequence, event):
+        if sequence != "<KeyPress>":
+            return None
+        if self.configured.get("state", "normal") != "normal":
+            return None
+        if self.textvariable is None:
+            return None
+        if not isinstance(event.keysym, str) or len(event.keysym) != 1:
+            return None
+        self.textvariable.set(f"{self.textvariable.get()}{event.keysym}")
+        return None
+
 
 class FakeTkVariable:
     def __init__(self, master=None, value=None):
@@ -525,13 +540,21 @@ class FakeTkVariable:
 
 
 def dispatch_child_event(child, parent, sequence, event):
+    child_or_parent_returned_break = False
     for (bound_sequence, _binding_id), callback in child.bindings.items():
         if bound_sequence == sequence:
             if callback(event) == "break":
-                return "break"
+                child_or_parent_returned_break = True
+                break
     for (bound_sequence, _binding_id), callback in parent.bindings.items():
-        if bound_sequence == sequence:
-            return callback(event)
+        if child_or_parent_returned_break:
+            break
+        if bound_sequence == sequence and callback(event) == "break":
+            child_or_parent_returned_break = True
+            break
+    if child_or_parent_returned_break:
+        return "break"
+    child._apply_default_class_binding(sequence, event)
     return None
 
 
@@ -950,6 +973,7 @@ def test_settings_window_recording_focuses_entry_and_binds_both(monkeypatch):
     window._record()
 
     assert window.hotkey_entry.focus_set_calls == 1
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_var.get() == ""
     assert "" in window.hotkey_var.set_calls
     assert {sequence for sequence, _ in window.hotkey_entry.bindings} == {
@@ -976,10 +1000,79 @@ def test_settings_window_rejected_recording_preserves_value_and_bindings(monkeyp
     window._record()
 
     assert window.hotkey_var.get() == "Ctrl+K"
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.hotkey_entry.focus_set_calls == 0
     assert window.hotkey_var.set_calls == []
+
+
+def test_settings_window_shortcut_entry_is_readonly_when_unlocked(monkeypatch):
+    window = make_settings_window(monkeypatch)
+
+    assert window.hotkey_entry.configured["state"] == "readonly"
+
+    window._record()
+    assert window.hotkey_entry.configured["state"] == "readonly"
+
+    assert (
+        dispatch_child_event(
+            window.hotkey_entry,
+            window.window,
+            "<KeyPress>",
+            FakeTkEvent(0xFF, keysym="Control_L"),
+        )
+        == "break"
+    )
+    assert window.hotkey_entry.configured["state"] == "readonly"
+
+    assert (
+        dispatch_child_event(
+            window.hotkey_entry,
+            window.window,
+            "<KeyPress>",
+            FakeTkEvent(0x4B, keysym="k"),
+        )
+        == "break"
+    )
+    assert window.hotkey_entry.configured["state"] == "readonly"
+
+    window._close()
+    assert window.hotkey_entry.configured["state"] == "readonly"
+
+
+def test_settings_window_shortcut_entry_is_disabled_when_locked(monkeypatch):
+    window = make_settings_window(monkeypatch, coordinator=make_coordinator([], locked=True))
+
+    assert window.hotkey_entry.configured["state"] == "disabled"
+
+
+def test_settings_window_readonly_entry_rejects_direct_text_but_accepts_programmatic_updates(
+    monkeypatch,
+):
+    window = make_settings_window(monkeypatch)
+
+    dispatch_child_event(
+        window.hotkey_entry,
+        window.window,
+        "<KeyPress>",
+        FakeTkEvent(0x4B, keysym="k"),
+    )
+
+    assert window.hotkey_var.get() == "F24"
+
+    window.hotkey_var.set("Ctrl+Shift+K")
+    assert window.hotkey_var.get() == "Ctrl+Shift+K"
+
+
+def test_settings_window_save_synchronizes_programmatic_display_value(monkeypatch):
+    window = make_settings_window(monkeypatch)
+
+    window.hotkey_var.set("K")
+    window._save()
+
+    assert window.view.hotkey_text == "K"
+    assert window.view.coordinator.current.toggle_hotkey == "K"
 
 
 def test_settings_window_dispatch(monkeypatch):
@@ -1010,6 +1103,7 @@ def test_settings_window_dispatch(monkeypatch):
     assert entry_result == "break"
     assert other_child_result == "break"
     assert len(calls) == 2
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.view.hotkey_text == "Ctrl+Shift"
 
 
@@ -1057,6 +1151,7 @@ def test_settings_window_handlers_return_break_and_synchronize(monkeypatch):
 
     assert window.hotkey_var.set_calls == ["Ctrl", "Ctrl+Shift", "Ctrl", "Ctrl+K"]
     assert window.hotkey_var.get() == "Ctrl+K"
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.save_button.configured["state"] == "normal"
@@ -1072,6 +1167,7 @@ def test_settings_window_focus_loss_cancels_active_recording(monkeypatch):
 
     assert window.view.recording is False
     assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.window.withdrawn is False
@@ -1092,6 +1188,7 @@ def test_settings_window_close_discards_unsaved_candidate(monkeypatch):
     window._close()
 
     assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.window.withdrawn is True
     assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
 
@@ -1148,6 +1245,7 @@ def test_settings_window_controller_value_error_during_completion_is_routed(monk
     assert errors == [error]
     assert window.hotkey_var.get() == "F24"
     assert window.view.recording is False
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.record_button.configured["state"] == "normal"
@@ -1175,6 +1273,7 @@ def test_settings_window_coordinator_value_error_during_release_is_routed(monkey
     assert errors == [error]
     assert window.hotkey_var.get() == "F24"
     assert window.view.recording is False
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.record_button.configured["state"] == "normal"
@@ -1211,6 +1310,7 @@ def test_settings_window_binding_failure_removes_partial_bindings(monkeypatch):
     with pytest.raises(RuntimeError, match="bind failed"):
         window._bind_recording_events()
 
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window._recording_bindings == []
@@ -1234,6 +1334,7 @@ def test_settings_window_record_binding_failure_cleans_up_and_shows_error(monkey
 
     assert errors == [error]
     assert window.view.recording is False
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_var.get() == "F24"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
@@ -1246,6 +1347,7 @@ def test_settings_window_cleanup(monkeypatch):
     completed._record()
     completed._on_key_press(FakeTkEvent(0x4B, keysym="k"))
     assert completed.hotkey_var.get() == "K"
+    assert completed.hotkey_entry.configured["state"] == "readonly"
     assert completed.hotkey_entry.bindings == {}
     assert completed.window.bindings == {}
     assert completed.record_button.configured["state"] == "normal"
@@ -1257,6 +1359,7 @@ def test_settings_window_cleanup(monkeypatch):
     focused._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
     focused._on_focus_out()
     assert focused.hotkey_var.get() == "F24"
+    assert focused.hotkey_entry.configured["state"] == "readonly"
     assert focused.hotkey_entry.bindings == {}
     assert focused.window.bindings == {}
     assert focused.window.withdrawn is False
@@ -1267,6 +1370,7 @@ def test_settings_window_cleanup(monkeypatch):
     locked._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
     locked.on_lock_state(True)
     assert locked.hotkey_var.get() == "F24"
+    assert locked.hotkey_entry.configured["state"] == "disabled"
     assert locked.hotkey_entry.bindings == {}
     assert locked.window.bindings == {}
     assert locked.window.withdrawn is True
@@ -1278,6 +1382,7 @@ def test_settings_window_cleanup(monkeypatch):
     closed._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
     closed._close()
     assert closed.hotkey_var.get() == "F24"
+    assert closed.hotkey_entry.configured["state"] == "readonly"
     assert closed.hotkey_entry.bindings == {}
     assert closed.window.bindings == {}
     assert closed.window.withdrawn is True
@@ -1301,6 +1406,7 @@ def test_settings_window_false_exit(monkeypatch):
     assert fatal_errors == []
     assert window.hotkey_var.get() == "K"
     assert window.view.recording is False
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
 
@@ -1326,6 +1432,7 @@ def test_settings_window_engine_unhealthy_and_ordinary_exception(monkeypatch, er
 
     assert window.hotkey_var.get() == "F24"
     assert window.view.recording is False
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.window.protocols["WM_DELETE_WINDOW"] == window._close
@@ -1353,6 +1460,7 @@ def test_settings_window_lock_ordinary_exception(monkeypatch):
 
     assert errors == [error]
     assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.configured["state"] == "disabled"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.window.withdrawn is True
@@ -1379,6 +1487,7 @@ def test_settings_window_lock_engine_unhealthy(monkeypatch):
 
     assert fatal_errors == [error]
     assert window.hotkey_var.get() == "F24"
+    assert window.hotkey_entry.configured["state"] == "disabled"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.window.withdrawn is True
@@ -1407,6 +1516,7 @@ def test_settings_window_close_failure_restores_and_withdraws(monkeypatch, error
 
     assert window.hotkey_var.get() == "F24"
     assert window.view.recording is False
+    assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
     assert window.window.withdrawn is True
