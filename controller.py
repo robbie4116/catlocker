@@ -37,8 +37,8 @@ class CatModeController:
     def lock(self) -> None:
         self._submit(CommandKind.SET_LOCKED, True)
 
-    def unlock(self) -> None:
-        self._submit(CommandKind.SET_LOCKED, False)
+    def unlock(self, *, timeout: float | None = None) -> None:
+        self._submit(CommandKind.SET_LOCKED, False, timeout=timeout)
 
     def toggle(self) -> None:
         self._submit(CommandKind.TOGGLE)
@@ -60,12 +60,14 @@ class CatModeController:
         self,
         kind: CommandKind,
         payload: object = None,
+        *,
+        timeout: float | None = None,
     ) -> CommandResult:
         try:
             return self.hook.submit(
                 kind,
                 payload,
-                timeout=self.command_timeout,
+                timeout=self.command_timeout if timeout is None else timeout,
             )
         except (HookTimeout, HookStopped) as exc:
             try:

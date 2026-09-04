@@ -26,11 +26,11 @@ from types import SimpleNamespace
 import pytest
 
 from controller import EngineUnhealthy
-from keyboard_hook import EngineEvent
+from keyboard_hook import EngineEvent, HookTimeout
 from main import AppLifecycle, create_application
 from settings import AppSettings
 from settings_window import StartupUpdateResult
-from tray import TrayAction, TrayFatalEvent
+from tray import TrayAction, TrayFatalEvent, TrayTimeout
 
 
 class FakeRoot:
@@ -105,6 +105,13 @@ class StalledHookCleanup(FakeHook):
         self.release_force.wait(timeout=1)
 
 
+class PartiallyStartedHook(FakeHook):
+    def start(self, timeout):
+        self.wait_timeouts.append(timeout)
+        self.calls.append(("hook_start_attempt",))
+        raise HookTimeout("hook startup timed out")
+
+
 class FakeController:
     def __init__(self, calls, unlock_error=None):
         self.calls = calls
@@ -116,8 +123,10 @@ class FakeController:
         self.calls.append(("controller_lock", threading.get_ident()))
         self.locked = True
 
-    def unlock(self):
+    def unlock(self, *, timeout=None):
         self.calls.append(("controller_unlock", threading.get_ident()))
+        self.unlock_timeouts = getattr(self, "unlock_timeouts", [])
+        self.unlock_timeouts.append(timeout)
         if self.unlock_error is not None:
             raise self.unlock_error
         self.locked = False
@@ -185,6 +194,13 @@ class StalledTrayCleanup(FakeTray):
         self.calls.append(("tray_force_remove_icon",))
         self.force_started.set()
         self.release_force.wait(timeout=1)
+
+
+class PartiallyStartedTray(FakeTray):
+    def start(self, timeout):
+        self.wait_timeouts.append(timeout)
+        self.calls.append(("tray_start_attempt",))
+        raise TrayTimeout("tray startup timed out")
 
 
 class RuntimeFatalTray(FakeTray):
@@ -388,6 +404,37 @@ def test_tray_start_failure_stops_hook_before_reporting():
     with pytest.raises(OSError, match="tray failed"):
         app.start()
     assert calls.index(("hook_stop",)) < calls.index(("root_show_error", "tray failed"))
+
+
+def test_hook_start_timeout_stops_partially_started_hook():
+    hook = PartiallyStartedHook([], SimpleNamespace(canonical="F24"))
+    app, calls = make_app(hook=hook)
+
+    with pytest.raises(HookTimeout, match="hook startup timed out"):
+        app.start()
+
+    assert ("hook_stop",) in hook.calls
+    assert ("tray_start",) not in calls
+
+
+def test_tray_start_timeout_stops_partially_started_tray():
+    tray = PartiallyStartedTray([])
+    app, calls = make_app(tray=tray)
+
+    with pytest.raises(TrayTimeout, match="tray startup timed out"):
+        app.start()
+
+    assert ("tray_stop",) in tray.calls
+    assert ("hook_stop",) in calls
+
+
+def test_shutdown_unlock_receives_remaining_global_budget():
+    app, _ = make_app(shutdown_timeout=0.01)
+    app.start()
+    app.shutdown()
+
+    assert app.controller.unlock_timeouts
+    assert 0 <= app.controller.unlock_timeouts[0] <= app.shutdown_timeout
 
 
 def test_startup_action_refreshes_presentations_and_shows_error():

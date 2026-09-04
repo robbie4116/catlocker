@@ -625,7 +625,11 @@ class NativeTray:
     def stop(self, timeout: float = 1.0) -> None:
         timeout = _require_finite_timeout(timeout, "stop")
         thread = self.thread
-        if thread is None or not thread.is_alive():
+        if thread is None:
+            return
+        if not thread.is_alive():
+            if self.cleanup_exception is not None:
+                raise TrayStopped("Native tray cleanup failed.") from self.cleanup_exception
             return
         if thread is threading.current_thread():
             raise TrayStopped("Native tray cannot stop itself.")
@@ -913,7 +917,8 @@ class NativeTray:
     def _show_notification(self, update: TrayUpdate) -> None:
         if self.notify_data is None:
             return
-        if self.state.locked:
+        locked = self.state.locked if update.locked is None else bool(update.locked)
+        if locked:
             message = "Cat Mode ON — Keyboard Locked"
         else:
             message = "Cat Mode OFF — Keyboard Unlocked"

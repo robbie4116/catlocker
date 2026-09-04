@@ -124,25 +124,25 @@ class AppLifecycle:
             return
 
         self.root.withdraw()
-        hook_started = False
-        tray_started = False
+        hook_attempted = False
+        tray_attempted = False
         try:
+            hook_attempted = True
             self.hook.start(timeout=self.thread_timeout)
-            hook_started = True
             if bool(getattr(self.hook, "locked", False)):
                 raise RuntimeError("CatLocker keyboard hook did not start unlocked.")
+            tray_attempted = True
             self.tray.start(timeout=self.thread_timeout)
-            tray_started = True
             self._running = True
             self._schedule_pump()
         except BaseException as error:
             self._running = False
-            if tray_started:
+            if tray_attempted:
                 try:
                     self.tray.stop(timeout=self.thread_timeout)
                 except BaseException:
                     pass
-            if hook_started:
+            if hook_attempted:
                 try:
                     self.hook.stop(timeout=self.thread_timeout)
                 except BaseException:
@@ -168,7 +168,9 @@ class AppLifecycle:
         self._pump_scheduled = False
 
         try:
-            self.controller.unlock()
+            self.controller.unlock(
+                timeout=self._remaining(deadline, self.command_timeout),
+            )
         except BaseException as error:
             self._report_error(error)
         finally:

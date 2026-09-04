@@ -338,6 +338,7 @@ class KeyboardHook:
         self._quit_state = _CLEANUP_AVAILABLE
         self._quit_token = None
         self._owner_thread_ident: int | None = None
+        self._intentional_stop = threading.Event()
         self._startup_condition = threading.Condition()
         self._startup_cancelled = threading.Event()
         self._pending_lock = threading.Lock()
@@ -391,6 +392,7 @@ class KeyboardHook:
         if thread is threading.current_thread():
             raise HookStopped("Keyboard hook cannot stop itself.")
 
+        self._intentional_stop.set()
         deadline = time.monotonic() + timeout
         stop_error: HookStopped | HookTimeout | None = None
         if thread.is_alive() and self.installation_exception is None:
@@ -476,6 +478,7 @@ class KeyboardHook:
     def post_quit(self) -> None:
         """Best-effort, idempotent emergency quit for the hook owner thread."""
         self._force_fail_open_unlocked()
+        self._intentional_stop.set()
         claim = self._claim_quit()
         if claim is None:
             return
@@ -641,6 +644,10 @@ class KeyboardHook:
                     self.api.translate(message)
                     self.api.dispatch(message)
             elif result == 0:
+                if not self._intentional_stop.is_set():
+                    raise HookStopped(
+                        "Keyboard hook message loop returned unexpectedly."
+                    )
                 return
             else:
                 raise ctypes.WinError()
@@ -674,6 +681,7 @@ class KeyboardHook:
 
     def _run_command(self, command: HookCommand) -> bool:
         if command.kind is CommandKind.STOP:
+            self._intentional_stop.set()
             self._force_fail_open_unlocked()
             self._stop_requested.set()
             accepted = self._unhook_owner()
@@ -748,7 +756,10 @@ class KeyboardHook:
         return committed, transition
 
     def _publish_snapshot(self) -> None:
-        self._published_snapshot = HookSnapshot(bool(self.state.locked))
+        locked = bool(self.state.locked)
+        if self._fail_open_active():
+            locked = False
+        self._published_snapshot = HookSnapshot(locked)
 
     def _publish_transition(self, transition) -> None:
         if transition.changed and not (transition.locked and self._fail_open_active()):
@@ -802,6 +813,8 @@ class KeyboardHook:
 
     def _put_event_safely(self, event: EngineEvent) -> None:
         try:
+            if event.kind == "state" and event.locked and self._fail_open_active():
+                return
             self.events.put(event)
         except BaseException:
             pass

@@ -353,6 +353,29 @@ def test_message_loop_error_deletes_icon_best_effort(tmp_path):
     assert api.destroy_icon_calls == [api.icon_handle]
 
 
+def test_dead_tray_stop_surfaces_cleanup_error_for_emergency_retry(tmp_path):
+    api = FakeTrayApi(
+        message_loop_error=OSError("message loop failed"),
+        delete_error=OSError("delete failed"),
+    )
+    tray = NativeTray(
+        actions=SimpleQueue(),
+        startup_enabled=False,
+        notifications=True,
+        icon_path=tmp_path / "icon.ico",
+        api=api,
+    )
+    tray.start(timeout=1)
+    api.wait_until(lambda: not tray.is_alive())
+
+    with pytest.raises(TrayStopped, match="cleanup failed"):
+        tray.stop(timeout=1)
+
+    api.delete_error = None
+    tray.force_remove_icon()
+    assert len(api.delete_calls) == 2
+
+
 def test_notifications_preference_is_observed_on_owner_thread():
     api, tray = started_tray(notifications=True)
     tray.post_notifications_enabled(False)
@@ -415,6 +438,21 @@ def test_later_lock_update_replaces_earlier_custom_tooltip():
         tray._drain_updates()
 
         assert tray.state.tooltip == "CatLocker — Keyboard Locked"
+    finally:
+        tray.stop(timeout=1)
+
+
+def test_newest_notification_message_uses_transition_state():
+    api, tray = started_tray(notifications=True)
+    try:
+        tray._updates.put(TrayUpdate(locked=True, reason="toggle"))
+        tray._updates.put(TrayUpdate(locked=False, reason="emergency"))
+        tray._updates.put(TrayUpdate(locked=True))
+        tray._drain_updates()
+
+        assert tray.state.locked is True
+        assert len(api.notification_calls) == 1
+        assert api.notification_calls[0].message == "Cat Mode OFF — Keyboard Unlocked"
     finally:
         tray.stop(timeout=1)
 

@@ -754,6 +754,51 @@ def test_locked_publication_precedes_command_acknowledgement():
         hook.stop(timeout=1)
 
 
+def test_fail_open_filters_locked_publication_after_gate(monkeypatch):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    publication_started = threading.Event()
+    release_publication = threading.Event()
+    original_put = hook._put_event_safely
+
+    def paused_put(event):
+        if event.kind == "state" and event.locked:
+            publication_started.set()
+            if not release_publication.wait(timeout=1):
+                raise AssertionError("test did not release event publication")
+        original_put(event)
+
+    monkeypatch.setattr(hook, "_put_event_safely", paused_put)
+    submit_result = []
+    submit_thread = threading.Thread(
+        target=lambda: submit_result.append(
+            hook.submit(CommandKind.SET_LOCKED, True, timeout=1)
+        )
+    )
+    submit_thread.start()
+    try:
+        assert publication_started.wait(timeout=1)
+        hook.enter_fail_open()
+        assert hook.locked is False
+        release_publication.set()
+        submit_thread.join(timeout=1)
+        assert not submit_thread.is_alive()
+        hook.submit(CommandKind.FAIL_OPEN, timeout=1)
+        assert hook._published_snapshot.locked is False
+
+        events = []
+        while True:
+            try:
+                events.append(hook.events.get_nowait())
+            except queue.Empty:
+                break
+        assert all(not (event.kind == "state" and event.locked) for event in events)
+    finally:
+        release_publication.set()
+        submit_thread.join(timeout=1)
+        hook.stop(timeout=1)
+
+
 def test_terminal_fail_open_is_immediately_visible_before_owner_reconciliation():
     api = FakeWin32Api()
     api.block_message_loop = threading.Event()
@@ -777,6 +822,22 @@ def test_terminal_fail_open_is_immediately_visible_before_owner_reconciliation()
     finally:
         api.release_get_message.set()
         api.messages.put((WM_QUIT, 0, 0))
+        if hook.thread is not None:
+            hook.thread.join(timeout=1)
+
+
+def test_unexpected_clean_hook_message_loop_return_publishes_fatal_event():
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        api.messages.put((WM_QUIT, 0, 0))
+        hook.thread.join(timeout=1)
+        assert not hook.is_alive()
+        event = hook.events.get_nowait()
+        assert event.kind == "fatal"
+        assert event.reason == "message_loop"
+        assert isinstance(event.error, HookStopped)
+    finally:
         if hook.thread is not None:
             hook.thread.join(timeout=1)
 
