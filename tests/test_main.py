@@ -201,6 +201,7 @@ class RuntimeFatalTray(FakeTray):
 class FakeSettingsWindow:
     def __init__(self, calls):
         self.calls = calls
+        self.view = SimpleNamespace(startup_enabled=False)
 
     def show(self):
         self.calls.append(("settings_show", threading.get_ident()))
@@ -209,6 +210,7 @@ class FakeSettingsWindow:
         self.calls.append(("settings_lock_state", bool(locked)))
 
     def on_startup_state(self, enabled):
+        self.view.startup_enabled = bool(enabled)
         self.calls.append(("settings_startup_state", bool(enabled)))
 
 
@@ -216,9 +218,11 @@ class FakeCoordinator:
     def __init__(self, calls, startup_result=None):
         self.calls = calls
         self.startup_result = startup_result
+        self.startup_requests = []
 
     def set_startup_enabled(self, enabled):
         self.calls.append(("startup_toggle", threading.get_ident()))
+        self.startup_requests.append(bool(enabled))
         if self.startup_result is not None:
             return self.startup_result
         return StartupUpdateResult(bool(enabled))
@@ -394,6 +398,47 @@ def test_startup_action_refreshes_presentations_and_shows_error():
     assert ("tray_startup_state", False) in calls
     assert ("settings_startup_state", False) in calls
     assert ("root_show_error", "registry denied") in calls
+
+
+def test_settings_startup_change_updates_lifecycle_tray_and_view():
+    app, _ = make_app(startup_result=StartupUpdateResult(True))
+    app.start()
+    app.apply_startup_result(app.coordinator.set_startup_enabled(True))
+
+    assert app._startup_enabled is True
+    assert app.tray.state.startup_enabled is True
+    assert app.settings_window.view.startup_enabled is True
+
+    app.coordinator.startup_result = StartupUpdateResult(False)
+    app.handle_tray_action(TrayAction.STARTUP)
+    assert app.coordinator.startup_requests[-1] is False
+
+
+def test_settings_startup_failure_publishes_actual_state_everywhere():
+    error = PermissionError("registry denied")
+    app, calls = make_app()
+    app.start()
+    app.apply_startup_result(StartupUpdateResult(True, error))
+
+    assert app._startup_enabled is True
+    assert app.tray.state.startup_enabled is True
+    assert app.settings_window.view.startup_enabled is True
+    assert ("root_show_error", "registry denied") in calls
+
+
+def test_settings_startup_failure_with_unknown_state_preserves_presentations():
+    error = PermissionError("registry unavailable")
+    app, calls = make_app()
+    app.start()
+    app.apply_startup_result(StartupUpdateResult(True))
+    calls.clear()
+
+    app.apply_startup_result(StartupUpdateResult(None, error))
+
+    assert app._startup_enabled is True
+    assert app.tray.state.startup_enabled is True
+    assert app.settings_window.view.startup_enabled is True
+    assert calls == [("root_show_error", "registry unavailable")]
 
 
 def test_create_application_wires_loaded_settings_and_actual_startup(tmp_path):

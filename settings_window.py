@@ -285,9 +285,7 @@ class SettingsViewModel:
     def set_startup_enabled(self, enabled: bool) -> StartupUpdateResult:
         result = self.coordinator.set_startup_enabled(enabled)
         if result.enabled is not None:
-            self.startup_enabled = result.enabled
-        if result.error is not None:
-            raise result.error
+            self.startup_enabled = bool(result.enabled)
         return result
 
     def on_lock_state(self, locked: bool) -> None:
@@ -439,13 +437,12 @@ class SettingsWindow:
         self.status_var.set("Settings saved.")
 
     def _startup_changed(self) -> None:
-        try:
-            self.view.set_startup_enabled(bool(self.startup_var.get()))
-        except OSError as exc:
-            self.startup_var.set(self.view.startup_enabled)
-            self._show_error(exc)
-        else:
-            self.startup_var.set(self.view.startup_enabled)
+        result = self.view.set_startup_enabled(bool(self.startup_var.get()))
+        self.startup_var.set(self.view.startup_enabled)
+        if self._on_startup_result is not None:
+            self._on_startup_result(result)
+        elif result.error is not None:
+            self._show_error(result.error)
 
     def _close(self) -> None:
         try:

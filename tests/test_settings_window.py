@@ -396,17 +396,24 @@ def fake_tk_module():
     return tk, messagebox
 
 
-def make_settings_window(monkeypatch, *, on_engine_unhealthy=None):
+def make_settings_window(
+    monkeypatch,
+    *,
+    on_engine_unhealthy=None,
+    on_startup_result=None,
+    coordinator=None,
+):
     import settings_window as settings_window_module
 
     tk, messagebox = fake_tk_module()
     monkeypatch.setitem(sys.modules, "tkinter", tk)
     monkeypatch.setitem(sys.modules, "tkinter.messagebox", messagebox)
-    coordinator = make_coordinator([])
+    coordinator = coordinator or make_coordinator([])
     return settings_window_module.SettingsWindow(
         object(),
         coordinator,
         on_engine_unhealthy=on_engine_unhealthy,
+        on_startup_result=on_startup_result,
     )
 
 
@@ -485,9 +492,9 @@ def test_view_startup_error_refreshes_checkbox_from_actual_registry_state():
     )
     view = SettingsViewModel(make_coordinator([], startup=startup), startup_enabled=False)
 
-    with pytest.raises(PermissionError, match="denied"):
-        view.set_startup_enabled(False)
+    result = view.set_startup_enabled(False)
 
+    assert result == StartupUpdateResult(True, startup.write_error)
     assert view.startup_enabled is True
 
 
@@ -565,3 +572,59 @@ def test_engine_unhealthy_routes_every_settings_handler_to_fatal_shutdown(
         window.on_lock_state(True)
 
     assert fatal_errors == [error]
+
+
+def test_settings_startup_change_publishes_result_to_application(monkeypatch):
+    results = []
+    window = make_settings_window(
+        monkeypatch,
+        on_startup_result=results.append,
+    )
+    window.startup_var.set(True)
+    window._startup_changed()
+
+    assert results == [StartupUpdateResult(True)]
+    assert window.view.startup_enabled is True
+
+
+def test_settings_startup_failure_publishes_actual_state(monkeypatch):
+    error = PermissionError("registry denied")
+    coordinator = make_coordinator(
+        [],
+        startup=FakeStartupRegistry(actual=True, write_error=error),
+    )
+    results = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_startup_result=results.append,
+    )
+    window.startup_var.set(False)
+    window._startup_changed()
+
+    assert results == [StartupUpdateResult(True, error)]
+    assert window.startup_var.get() is True
+
+
+def test_settings_startup_unknown_state_preserves_value(monkeypatch):
+    error = PermissionError("registry unavailable")
+    coordinator = make_coordinator(
+        [],
+        startup=FakeStartupRegistry(
+            actual=False,
+            write_error=error,
+            refresh_error=OSError("read denied"),
+        ),
+    )
+    results = []
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        on_startup_result=results.append,
+    )
+    window.startup_var.set(True)
+    window._startup_changed()
+
+    assert results == [StartupUpdateResult(None, error)]
+    assert window.view.startup_enabled is False
+    assert window.startup_var.get() is False
