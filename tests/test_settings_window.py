@@ -747,6 +747,51 @@ def test_view_updates_live_preview():
     assert view.recording is False
 
 
+def test_view_records_and_saves_both_actions():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x86, keysym="F23"))
+    view.select_action("unlock")
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x87, keysym="F24"))
+    saved = view.save()
+    assert saved.lock_hotkey == "F23"
+    assert saved.unlock_hotkey == "F24"
+    view.select_action("lock")
+    assert view.hotkey_text == "F23"
+
+
+def test_window_records_both_rows_and_cancel_restores_saved_values(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window._record_action("lock")
+    window._on_key_press(FakeTkEvent(0x86, keysym="F23"))
+    window._record_action("unlock")
+    window._on_key_press(FakeTkEvent(0x85, keysym="F22"))
+    window._save()
+    assert window.view.coordinator.current.lock_hotkey == "F23"
+    assert window.view.coordinator.current.unlock_hotkey == "F22"
+    window._record_action("lock")
+    window._on_key_press(FakeTkEvent(0x87, keysym="F24"))
+    window._close()
+    assert window._shortcut_rows["lock"][0].get() == "F23"
+    assert window._shortcut_rows["unlock"][0].get() == "F22"
+
+
+def test_pair_is_rolled_back_when_persistence_fails():
+    previous = AppSettings(lock_hotkey="F22", unlock_hotkey="F23")
+    coordinator = make_coordinator([], current=previous, persist_error=OSError("disk full"))
+    replacements = []
+    coordinator.controller.replace_shortcut = lambda pair: replacements.append(pair) or 1
+    with pytest.raises(OSError):
+        coordinator.save("F24", True, unlock_hotkey="F21")
+    assert replacements[0].lock.canonical == "F24"
+    assert replacements[0].unlock.canonical == "F21"
+    assert replacements[1].lock.canonical == "F22"
+    assert replacements[1].unlock.canonical == "F23"
+    assert coordinator.current == previous
+
+
 def test_view_save_is_disabled_during_partial_recording():
     coordinator = make_coordinator([])
     view = SettingsViewModel(coordinator)

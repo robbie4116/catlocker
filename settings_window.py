@@ -19,6 +19,7 @@ from hotkeys import (
     VK_RSHIFT,
     VK_RWIN,
     format_pressed_vks,
+    ShortcutPair,
     format_shortcut,
     parse_shortcut,
     shortcut_from_pressed_vks,
@@ -198,33 +199,39 @@ class SettingsCoordinator:
 
     def save(
         self,
-        toggle_hotkey: str,
+        lock_hotkey: str,
         notifications: bool,
         *,
         confirm_warning: Callable[[tuple[str, ...]], bool] | None = None,
+        unlock_hotkey: str | None = None,
     ) -> AppSettings:
         if self.controller.locked:
             raise SettingsLocked("Settings are unavailable while Cat Mode is locked.")
 
         if self._recording:
             self.end_recording()
-        shortcut = self._candidate
+        shortcut = self._candidate if unlock_hotkey is None else None
         if shortcut is None:
-            if not isinstance(toggle_hotkey, str):
+            if not isinstance(lock_hotkey, str):
                 raise ShortcutError("A shortcut must be text.")
-            shortcut = validate_shortcut(parse_shortcut(toggle_hotkey)).shortcut
+            shortcut = validate_shortcut(parse_shortcut(lock_hotkey)).shortcut
         validation = validate_shortcut(shortcut)
-        if validation.warnings:
-            if confirm_warning is None or not confirm_warning(validation.warnings):
+        unlock_validation = validate_shortcut(parse_shortcut(unlock_hotkey)) if unlock_hotkey is not None else validation
+        warnings = tuple(dict.fromkeys(validation.warnings + unlock_validation.warnings))
+        if warnings:
+            if confirm_warning is None or not confirm_warning(warnings):
                 raise WarningDeclined("Shortcut warning was not confirmed.")
 
         candidate = AppSettings(
-            toggle_hotkey=validation.shortcut.canonical,
+            lock_hotkey=validation.shortcut.canonical,
+            unlock_hotkey=unlock_validation.shortcut.canonical,
             notifications=bool(notifications),
         )
         previous = self._current
         try:
-            accepted = self.controller.replace_shortcut(validation.shortcut)
+            accepted = self.controller.replace_shortcut(
+                ShortcutPair(validation.shortcut, unlock_validation.shortcut)
+            )
         except EngineUnhealthy:
             self._clear_candidate()
             raise
@@ -236,7 +243,8 @@ class SettingsCoordinator:
         except Exception:
             try:
                 rollback = self.controller.replace_shortcut(
-                    parse_shortcut(previous.toggle_hotkey)
+                    ShortcutPair(parse_shortcut(previous.lock_hotkey),
+                                 parse_shortcut(previous.unlock_hotkey))
                 )
             except EngineUnhealthy:
                 self._clear_candidate()
@@ -444,12 +452,29 @@ class SettingsViewModel:
     ) -> None:
         self.coordinator = coordinator
         self._key_label_resolver = key_label_resolver
-        self._accepted_canonical = coordinator.current.toggle_hotkey
+        self.action = "lock"
+        self._drafts = {"lock": coordinator.current.lock_hotkey, "unlock": coordinator.current.unlock_hotkey}
+        self._accepted_canonical = coordinator.current.lock_hotkey
         self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
         self.notifications = coordinator.current.notifications
         self.startup_enabled = bool(startup_enabled)
         self._recording = False
         self._locked = bool(coordinator.controller.locked)
+
+    def _capture_draft(self):
+        candidate = self.coordinator.pending_shortcut
+        if candidate is not None:
+            self._drafts[self.action] = candidate.canonical
+            self.coordinator.discard_candidate()
+
+    def select_action(self, action):
+        if action not in ("lock", "unlock"):
+            raise ValueError(action)
+        self.cancel_recording()
+        self._capture_draft()
+        self.action = action
+        self._accepted_canonical = self._drafts[action]
+        self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
 
     def _display_shortcut(self, shortcut: Shortcut) -> str:
         return format_shortcut(
@@ -565,6 +590,9 @@ class SettingsViewModel:
         finally:
             self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             self.notifications = self.coordinator.current.notifications
+            self._drafts = {"lock": self.coordinator.current.lock_hotkey, "unlock": self.coordinator.current.unlock_hotkey}
+            self._accepted_canonical = self._drafts[self.action]
+            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
 
     def save(
         self,
@@ -573,18 +601,21 @@ class SettingsViewModel:
     ) -> AppSettings:
         if self._recording:
             self.cancel_recording()
+        self._capture_draft()
         try:
             saved = self.coordinator.save(
-                self._accepted_canonical,
+                self._drafts["lock"],
                 self.notifications,
                 confirm_warning=confirm_warning,
+                unlock_hotkey=self._drafts["unlock"],
             )
         except Exception:
             self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             raise
-        self.hotkey_text = self._display_shortcut(parse_shortcut(saved.toggle_hotkey))
+        self._drafts = {"lock": saved.lock_hotkey, "unlock": saved.unlock_hotkey}
+        self._accepted_canonical = self._drafts[self.action]
+        self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
         self.notifications = saved.notifications
-        self._accepted_canonical = saved.toggle_hotkey
         return saved
 
     def set_startup_enabled(self, enabled: bool) -> StartupUpdateResult:
@@ -644,17 +675,23 @@ class SettingsWindow:
 
         frame = tk.Frame(self.window, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
-        tk.Label(frame, text="Toggle shortcut:").pack(anchor="w")
+        tk.Label(frame, text="Lock keyboard:").pack(anchor="w")
         self.hotkey_entry = tk.Entry(frame, textvariable=self.hotkey_var)
         self.hotkey_entry.pack(fill="x", pady=(0, 8))
-        buttons = tk.Frame(frame)
-        buttons.pack(fill="x")
-        self.record_button = tk.Button(buttons, text=self.view.record_label, command=self._record)
-        self.record_button.pack(side="left")
-        self.save_button = tk.Button(buttons, text="Save", command=self._save)
-        self.save_button.pack(side="left", padx=(8, 0))
-        self.cancel_button = tk.Button(buttons, text="Cancel", command=self._close)
-        self.cancel_button.pack(side="right")
+        self.record_button = tk.Button(frame, text="Record lock shortcut", command=lambda: self._record_action("lock"))
+        self.record_button.pack(anchor="w")
+        tk.Label(frame, text="Unlock keyboard:").pack(anchor="w", pady=(12, 0))
+        self.unlock_var = tk.StringVar(self.window, value=self.view._display_shortcut(parse_shortcut(coordinator.current.unlock_hotkey)))
+        self.unlock_entry = tk.Entry(frame, textvariable=self.unlock_var)
+        self.unlock_entry.pack(fill="x", pady=(0, 8))
+        self.unlock_button = tk.Button(frame, text="Record unlock shortcut", command=lambda: self._record_action("unlock"))
+        self.unlock_button.pack(anchor="w")
+        tk.Label(frame, text="Use the same shortcut for both to toggle.").pack(anchor="w", pady=(8, 0))
+        self._shortcut_rows = {
+            "lock": (self.hotkey_var, self.hotkey_entry, self.record_button),
+            "unlock": (self.unlock_var, self.unlock_entry, self.unlock_button),
+        }
+
         tk.Checkbutton(
             frame,
             text="Start with Windows",
@@ -667,6 +704,13 @@ class SettingsWindow:
             variable=self.notifications_var,
         ).pack(anchor="w")
         tk.Label(frame, textvariable=self.status_var).pack(anchor="w", pady=(8, 0))
+        buttons = tk.Frame(frame)
+        buttons.pack(fill="x", pady=(12, 0))
+        self.save_button = tk.Button(buttons, text="Save", command=self._save)
+        self.save_button.pack(side="left")
+        self.cancel_button = tk.Button(buttons, text="Cancel", command=self._close)
+        self.cancel_button.pack(side="right")
+
 
         self._recording_bindings: list[tuple[object, str, str]] = []
         self._recording_poll_id = None
@@ -705,6 +749,13 @@ class SettingsWindow:
     def on_startup_state(self, enabled: bool) -> None:
         self.view.startup_enabled = bool(enabled)
         self.startup_var.set(self.view.startup_enabled)
+
+    def _record_action(self, action):
+        self._cleanup_recording_state()
+        self.view.select_action(action)
+        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[action]
+        self.hotkey_var.set(self.view.hotkey_text)
+        self._record()
 
     def _record(self) -> None:
         try:
@@ -928,8 +979,13 @@ class SettingsWindow:
         self._show_error(error)
 
     def _sync_controls(self) -> None:
+        for action, (variable, entry, button) in getattr(self, "_shortcut_rows", {}).items():
+            entry.configure(state="disabled" if self.view.locked else "readonly")
+            button.configure(text=f"Record {action} shortcut", state="normal" if self.view.record_enabled else "disabled")
+            if action != self.view.action:
+                variable.set(self.view._display_shortcut(parse_shortcut(self.view._drafts[action])))
         self.record_button.configure(
-            text=self.view.record_label,
+            text="Press a shortcut..." if self.view.recording else f"Record {self.view.action} shortcut",
             state="normal" if self.view.record_enabled else "disabled",
         )
         self.save_button.configure(

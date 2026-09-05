@@ -3,7 +3,7 @@ from __future__ import annotations
 import queue
 from dataclasses import dataclass
 
-from hotkeys import Shortcut
+from hotkeys import Shortcut, ShortcutPair
 from keyboard_hook import (
     CommandKind,
     CommandResult,
@@ -52,7 +52,7 @@ class CatModeController:
     def toggle(self) -> None:
         self._submit(CommandKind.TOGGLE)
 
-    def replace_shortcut(self, shortcut: Shortcut) -> int | None:
+    def replace_shortcut(self, shortcut: Shortcut | ShortcutPair) -> int | None:
         result = self._submit(CommandKind.REPLACE_SHORTCUT, shortcut)
         return result.shortcut_generation if result.accepted else None
 

@@ -408,7 +408,7 @@ def create_application(
 
     try:
         from controller import CatModeController
-        from hotkeys import parse_shortcut
+        from hotkeys import ShortcutPair, parse_shortcut
         from keyboard_hook import KeyboardHook
         from settings import (
             StartupRegistry,
@@ -455,7 +455,8 @@ def create_application(
         else:
             current_config_path = Path(config_path)
         current_settings = load_settings(current_config_path)
-        shortcut = parse_shortcut(current_settings.toggle_hotkey)
+        shortcut = ShortcutPair(parse_shortcut(current_settings.lock_hotkey),
+                                parse_shortcut(current_settings.unlock_hotkey))
         actions: queue.SimpleQueue = queue.SimpleQueue()
 
         def default_hook(value):

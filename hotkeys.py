@@ -239,14 +239,32 @@ class Transition:
     reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ShortcutPair:
+    lock: Shortcut
+    unlock: Shortcut
+
+    @property
+    def canonical(self):
+        return self.lock.canonical
+
+
 class InputState:
-    def __init__(self, shortcut: Shortcut, *, locked: bool = False):
+    @property
+    def shortcut(self) -> Shortcut:
+        return self.shortcuts.unlock if self.locked else self.shortcuts.lock
+
+    @shortcut.setter
+    def shortcut(self, value: Shortcut | ShortcutPair) -> None:
+        self.shortcuts = value if isinstance(value, ShortcutPair) else ShortcutPair(value, value)
+
+    def __init__(self, shortcut: Shortcut | ShortcutPair, *, locked: bool = False):
         self.shortcut = shortcut
         self.locked = locked
         self.pressed: set[int] = set()
         self.passed_down: set[int] = set()
         self.suppressed_down: set[int] = set()
-        self.toggle_latched = False
+        self.latched_triggers: set[int] = set()
         self.emergency_latched = False
         self.recording = False
         self._tap_tracker = None
@@ -266,12 +284,12 @@ class InputState:
         self.recording = False
         self._reset_taps()
 
-    def replace_shortcut(self, shortcut: Shortcut) -> bool:
+    def replace_shortcut(self, shortcut: Shortcut | ShortcutPair) -> bool:
         if self.locked:
             return False
         self.exit_recording()
         self.shortcut = shortcut
-        self.toggle_latched = shortcut.trigger_vk in self.pressed
+        self.latched_triggers = {key.trigger_vk for key in (self.shortcuts.lock, self.shortcuts.unlock) if key.trigger_vk in self.pressed}
         self._ensure_tap_tracker()
         self._reset_taps()
         return True
@@ -338,10 +356,10 @@ class InputState:
         elif (
             not self.recording
             and not self.shortcut.is_standalone
-            and not self.toggle_latched
+            and event.vk not in self.latched_triggers
             and self.shortcut.matches(self.pressed, event.vk)
         ):
-            self.toggle_latched = True
+            self.latched_triggers.add(event.vk)
             self.locked = not self.locked
             suppress = True
             reason = "toggle"
@@ -364,8 +382,7 @@ class InputState:
         self.pressed.discard(vk)
         self.passed_down.discard(vk)
         self.suppressed_down.discard(vk)
-        if vk == self.shortcut.trigger_vk:
-            self.toggle_latched = False
+        self.latched_triggers.discard(vk)
         if vk in {VK_LCONTROL, VK_RCONTROL}:
             self.emergency_latched = False
 
@@ -406,7 +423,7 @@ class InputState:
         self.pressed.clear()
         self.passed_down.clear()
         self.suppressed_down.clear()
-        self.toggle_latched = False
+        self.latched_triggers.clear()
         self.emergency_latched = False
         self.recording = False
         self._reset_taps()

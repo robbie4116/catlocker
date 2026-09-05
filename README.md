@@ -2,7 +2,7 @@
 
 CatLocker is a Windows 11-only tray utility that locks keyboard input while leaving the mouse usable. It is designed to sit in the notification area, always starts unlocked, and recover from the mouse or an exact `Left Ctrl + Right Ctrl` chord.
 
-The default setup is `F24`, which makes CatLocker practical with a Stream Deck or any other device that can send `F24`. You can also configure a different shortcut if it fits your workflow better.
+The default setup is `F24`, which makes CatLocker practical with a Stream Deck or any other device that can send `F24`. Settings provides separate **Lock keyboard** and **Unlock keyboard** shortcuts. Assign the same shortcut to both for toggle behavior, or different shortcuts for each action. Existing toggle shortcuts are loaded into both fields.
 
 ## What it does
 
@@ -19,7 +19,7 @@ If CatLocker is locked, you can always recover in one of these ways:
 
 - Press the tray icon and choose `Unlock Keyboard`.
 - Press the exact `Left Ctrl + Right Ctrl` chord.
-- Use the configured keyboard shortcut again if you are intentionally toggling state.
+- Press your configured unlock keyboard shortcut.
 
 The tray menu also includes `Lock Keyboard` and `Toggle Cat Mode`. When the app is locked, the tray `Unlock Keyboard` command remains available and the Settings window is disabled until the keyboard is unlocked again.
 
@@ -34,8 +34,8 @@ CatLocker accepts shortcuts in modifier-plus-trigger form. Examples:
 - `VolumeUp` when a supported Fn combination produces that native key event
 
 New recordings preserve the physical modifier side. A standalone shortcut is exactly one modifier, such as
-`RAlt`; it toggles on release only when no other key was held or pressed during that hold. Modifier-plus-trigger
-shortcuts toggle on the trigger key-down as before. While locked, standalone modifier events are still blocked and
+`RAlt`; it performs its action on release only when no other key was held or pressed during that hold. Modifier-plus-trigger
+shortcuts perform their action on the trigger key-down. While locked, standalone modifier events are still blocked and
 the release performs the unlock transition without leaving an unmatched key event.
 
 Existing generic shortcuts such as `Ctrl+Shift+K` remain generic and continue to accept either or both physical

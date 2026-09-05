@@ -14,10 +14,21 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE = "CatLocker"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class AppSettings:
-    toggle_hotkey: str = "F24"
+    lock_hotkey: str = "F24"
+    unlock_hotkey: str = "F24"
     notifications: bool = True
+
+    def __init__(self, toggle_hotkey="F24", notifications=True, *, lock_hotkey=None, unlock_hotkey=None):
+        object.__setattr__(self, "lock_hotkey", toggle_hotkey if lock_hotkey is None else lock_hotkey)
+        object.__setattr__(self, "unlock_hotkey", toggle_hotkey if unlock_hotkey is None else unlock_hotkey)
+        object.__setattr__(self, "notifications", notifications)
+
+    @property
+    def toggle_hotkey(self):
+        """Compatibility alias for callers using the old single-shortcut API."""
+        return self.lock_hotkey
 
 
 def build_startup_command(
@@ -99,9 +110,11 @@ def resolve_config_path(executable_dir: Path, local_appdata: Path) -> Path:
 
 
 def encode_settings(settings: AppSettings) -> str:
-    hotkey = settings.toggle_hotkey.replace("\\", "\\\\").replace('"', '\\"')
+    import json
     notifications = "true" if settings.notifications else "false"
-    return f'toggle_hotkey = "{hotkey}"\nnotifications = {notifications}\n'
+    return (f'lock_hotkey = {json.dumps(settings.lock_hotkey)}\n'
+            f'unlock_hotkey = {json.dumps(settings.unlock_hotkey)}\n'
+            f'notifications = {notifications}\n')
 
 
 def _canonicalize_hotkey(raw: str) -> str:
@@ -112,7 +125,8 @@ def _canonicalize_hotkey(raw: str) -> str:
 
 def _canonicalize_settings(settings: AppSettings) -> AppSettings:
     return AppSettings(
-        toggle_hotkey=_canonicalize_hotkey(settings.toggle_hotkey),
+        lock_hotkey=_canonicalize_hotkey(settings.lock_hotkey),
+        unlock_hotkey=_canonicalize_hotkey(settings.unlock_hotkey),
         notifications=settings.notifications,
     )
 
@@ -157,7 +171,15 @@ def load_settings(path: Path) -> AppSettings:
     if isinstance(raw_notifications, bool):
         notifications = raw_notifications
 
-    return AppSettings(toggle_hotkey=hotkey, notifications=notifications)
+    def read_hotkey(name):
+        try:
+            return _canonicalize_hotkey(loaded.get(name, hotkey))
+        except ShortcutError:
+            return hotkey
+
+    return AppSettings(lock_hotkey=read_hotkey("lock_hotkey"),
+                       unlock_hotkey=read_hotkey("unlock_hotkey"),
+                       notifications=notifications)
 
 
 def save_settings(

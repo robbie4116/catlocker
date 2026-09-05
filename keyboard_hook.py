@@ -9,7 +9,7 @@ from ctypes import wintypes
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from hotkeys import InputState, KeyEvent, Shortcut
+from hotkeys import InputState, KeyEvent, Shortcut, ShortcutPair
 from key_identity import LLKHF_EXTENDED, LLKHF_INJECTED, normalize_key_event
 from recording_channel import RecordingChannel
 
@@ -318,7 +318,7 @@ class Win32Api:
 class KeyboardHook:
     def __init__(
         self,
-        shortcut: Shortcut,
+        shortcut: Shortcut | ShortcutPair,
         *,
         api: Win32Api | None = None,
         locked: bool = False,
