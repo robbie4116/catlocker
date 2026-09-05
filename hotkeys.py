@@ -440,6 +440,12 @@ def format_pressed_vks(
                 MODIFIER_VK_NAMES[vk]
                 for vk in sorted(pressed & MODIFIER_VKS[family])
             )
+            if any(
+                int(vk) in GENERIC_MODIFIER_VKS
+                and GENERIC_MODIFIER_VKS[int(vk)] is family
+                for vk in pressed
+            ):
+                parts.append(family.value)
     else:
         active_modifiers = active_modifier_families(pressed)
         parts.extend(family.value for family in MODIFIER_ORDER if family in active_modifiers)
