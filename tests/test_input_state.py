@@ -6,12 +6,15 @@ from hotkeys import (
     InputState,
     KeyEvent,
     Transition,
+    VK_CONTROL,
     VK_LCONTROL,
     VK_RCONTROL,
     VK_LSHIFT,
     VK_RSHIFT,
+    UnpairedKeyEvent,
     parse_shortcut,
 )
+from key_identity import normalize_key_event
 
 F24 = 0x87
 K = 0x4B
@@ -331,3 +334,65 @@ def test_suppressed_standalone_modifier_release_is_delivered_when_release_unlock
 
     assert result.suppress is True
     assert result.locked is False
+
+
+def test_resolved_modifier_down_pairs_with_unresolved_modifier_release():
+    state = InputState(parse_shortcut("Ctrl+K"))
+    state.handle(
+        normalize_key_event(
+            VK_CONTROL,
+            scan_code=0x1D,
+            flags=0,
+            is_keydown=True,
+        )
+    )
+
+    state.handle(
+        normalize_key_event(
+            VK_CONTROL,
+            scan_code=0,
+            flags=0,
+            is_keydown=False,
+        )
+    )
+
+    assert state.pressed == set()
+
+
+def test_unresolved_modifier_down_pairs_with_resolved_modifier_release():
+    state = InputState(parse_shortcut("Ctrl+K"))
+    state.handle(
+        normalize_key_event(
+            VK_CONTROL,
+            scan_code=0,
+            flags=0,
+            is_keydown=True,
+        )
+    )
+
+    state.handle(
+        normalize_key_event(
+            VK_CONTROL,
+            scan_code=0x1D,
+            flags=0,
+            is_keydown=False,
+        )
+    )
+
+    assert state.pressed == set()
+
+
+def test_ambiguous_modifier_release_fails_safe_when_both_sides_are_held():
+    state = InputState(parse_shortcut("Ctrl+K"))
+    state.handle(down(VK_LCONTROL))
+    state.handle(down(VK_RCONTROL))
+
+    with pytest.raises(UnpairedKeyEvent):
+        state.handle(
+            normalize_key_event(
+                VK_CONTROL,
+                scan_code=0,
+                flags=0,
+                is_keydown=False,
+            )
+        )

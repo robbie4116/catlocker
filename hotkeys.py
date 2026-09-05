@@ -8,6 +8,10 @@ class ShortcutError(ValueError):
     pass
 
 
+class UnpairedKeyEvent(RuntimeError):
+    pass
+
+
 class Modifier(Enum):
     CTRL = "Ctrl"
     ALT = "Alt"
@@ -352,16 +356,17 @@ class InputState:
 
     def _handle_up(self, event: KeyEvent) -> Transition:
         self._ensure_tap_tracker()
-        suppress = self._release_is_suppressed(event.vk)
+        vk = self._release_vk(event)
+        suppress = self._release_is_suppressed(vk)
         eligible_release = False
         if self._tap_tracker is not None:
-            eligible_release = self._tap_tracker.observe_up(event.vk)
-        self.pressed.discard(event.vk)
-        self.passed_down.discard(event.vk)
-        self.suppressed_down.discard(event.vk)
-        if event.vk == self.shortcut.trigger_vk:
+            eligible_release = self._tap_tracker.observe_up(vk)
+        self.pressed.discard(vk)
+        self.passed_down.discard(vk)
+        self.suppressed_down.discard(vk)
+        if vk == self.shortcut.trigger_vk:
             self.toggle_latched = False
-        if event.vk in {VK_LCONTROL, VK_RCONTROL}:
+        if vk in {VK_LCONTROL, VK_RCONTROL}:
             self.emergency_latched = False
 
         previous_locked = self.locked
@@ -371,12 +376,31 @@ class InputState:
             and not self.recording
             and not self.emergency_latched
             and self.shortcut.is_standalone
-            and event.vk == self.shortcut.trigger_vk
+            and vk == self.shortcut.trigger_vk
             and event.is_resolved_modifier
         ):
             self.locked = not self.locked
             reason = "toggle"
         return Transition(suppress, self.locked, self.locked != previous_locked, reason)
+
+    def _release_vk(self, event: KeyEvent) -> int:
+        if event.vk in self.pressed:
+            return event.vk
+        family = event.modifier_family or modifier_family_for_vk(event.vk)
+        if family is None:
+            return event.vk
+        candidates = {
+            vk
+            for vk in self.pressed
+            if modifier_family_for_vk(vk) is family
+        }
+        if len(candidates) > 1:
+            raise UnpairedKeyEvent(
+                f"Cannot pair an ambiguous {family.value} key release."
+            )
+        if candidates:
+            return next(iter(candidates))
+        return event.vk
 
     def reset_runtime(self) -> None:
         self.pressed.clear()
