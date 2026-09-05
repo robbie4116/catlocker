@@ -283,11 +283,31 @@ class RaisingEvents:
     ],
 )
 def test_keyboard_messages_translate_to_pure_events(message, is_keydown):
-    data = KBDLLHOOKSTRUCT(vkCode=0x87, scanCode=0, flags=LLKHF_INJECTED, time=0, dwExtraInfo=0)
+    data = KBDLLHOOKSTRUCT(vkCode=0x87, scanCode=7, flags=LLKHF_INJECTED, time=0, dwExtraInfo=0)
     event = event_from_message(message, data)
     assert event.vk == 0x87
+    assert event.raw_vk == 0x87
+    assert event.scan_code == 7
+    assert event.flags == LLKHF_INJECTED
     assert event.is_keydown is is_keydown
     assert event.injected is True
+
+
+def test_system_key_messages_preserve_native_modifier_identity():
+    data = KBDLLHOOKSTRUCT(
+        vkCode=0x12,
+        scanCode=0x38,
+        flags=1,
+        time=0,
+        dwExtraInfo=0,
+    )
+
+    event = event_from_message(WM_SYSKEYDOWN, data)
+
+    assert event.vk == 0xA5
+    assert event.raw_vk == 0x12
+    assert event.scan_code == 0x38
+    assert event.flags == 1
 
 
 def test_unknown_message_is_not_a_keyboard_event():

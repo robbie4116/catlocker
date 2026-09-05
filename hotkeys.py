@@ -283,6 +283,9 @@ class InputState:
         return self._handle_down(event) if event.is_keydown else self._handle_up(event)
 
     def _ensure_tap_tracker(self) -> None:
+        if not self.shortcut.is_standalone:
+            self._tap_tracker = None
+            return
         if self._tap_tracker is None:
             from modifier_tap import ModifierTapTracker
 

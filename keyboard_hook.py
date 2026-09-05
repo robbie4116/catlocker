@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from hotkeys import InputState, KeyEvent, Shortcut
+from key_identity import LLKHF_EXTENDED, LLKHF_INJECTED, normalize_key_event
 
 
 WH_KEYBOARD_LL = 13
@@ -21,7 +22,6 @@ WM_SYSKEYUP = 0x0105
 WM_QUIT = 0x0012
 WM_APP_COMMAND = 0x8001
 PM_NOREMOVE = 0x0000
-LLKHF_INJECTED = 0x10
 MAX_SAFE_TIMEOUT = threading.TIMEOUT_MAX
 _CLEANUP_AVAILABLE = "available"
 _CLEANUP_IN_PROGRESS = "in_progress"
@@ -159,10 +159,11 @@ def event_from_message(message: int, data: KBDLLHOOKSTRUCT) -> KeyEvent | None:
         is_keydown = False
     else:
         return None
-    return KeyEvent(
+    return normalize_key_event(
         int(data.vkCode),
-        is_keydown,
-        bool(data.flags & LLKHF_INJECTED),
+        scan_code=int(data.scanCode),
+        flags=int(data.flags),
+        is_keydown=is_keydown,
     )
 
 
