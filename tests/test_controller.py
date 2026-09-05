@@ -14,6 +14,7 @@ from keyboard_hook import (
     HookTimeout,
 )
 from controller import CatModeController, EngineUnhealthy
+from recording_channel import RecordingChannel
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,3 +183,26 @@ def test_controller_exposes_explicit_terminal_fail_open():
     controller.enter_fail_open()
 
     assert hook.fail_open_calls == 1
+
+
+def test_controller_exposes_acknowledged_recording_session_and_channel():
+    channel = RecordingChannel("session-7")
+    hook = FakeHook(
+        result=CommandResult(
+            1,
+            True,
+            False,
+            0,
+            recording_session_id="session-7",
+            held_keys=frozenset({0x41}),
+            recording_channel=channel,
+        )
+    )
+    controller = CatModeController(hook)
+
+    session = controller.begin_recording()
+
+    assert session.session_id == "session-7"
+    assert session.held_keys == frozenset({0x41})
+    assert session.channel is channel
+    assert hook.calls == [HookCall(CommandKind.ENTER_RECORDING, None, 1.0)]

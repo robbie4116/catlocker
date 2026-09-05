@@ -11,6 +11,7 @@ from enum import Enum, auto
 
 from hotkeys import InputState, KeyEvent, Shortcut
 from key_identity import LLKHF_EXTENDED, LLKHF_INJECTED, normalize_key_event
+from recording_channel import RecordingChannel
 
 
 WH_KEYBOARD_LL = 13
@@ -37,6 +38,8 @@ class CommandKind(Enum):
     REPLACE_SHORTCUT = auto()
     ENTER_RECORDING = auto()
     EXIT_RECORDING = auto()
+    CANCEL_RECORDING = auto()
+    FINISH_RECORDING = auto()
     FAIL_OPEN = auto()
     STOP = auto()
 
@@ -104,6 +107,9 @@ class CommandResult:
     accepted: bool
     locked: bool
     shortcut_generation: int
+    recording_session_id: object | None = None
+    held_keys: frozenset[int] = frozenset()
+    recording_channel: RecordingChannel | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +322,7 @@ class KeyboardHook:
         *,
         api: Win32Api | None = None,
         locked: bool = False,
+        recording_capacity: int = 256,
     ) -> None:
         self.api = api if api is not None else Win32Api()
         self.state = InputState(shortcut, locked=locked)
@@ -330,6 +337,10 @@ class KeyboardHook:
         self.installation_exception: BaseException | None = None
         self.cleanup_exception: BaseException | None = None
         self.shortcut_generation = 0
+        self.recording_capacity = int(recording_capacity)
+        self._next_recording_session_id = 1
+        self._recording_session_id: object | None = None
+        self._recording_channel: RecordingChannel | None = None
 
         self._hook_lock = threading.Lock()
         self._hook_cleanup_state = _CLEANUP_AVAILABLE
@@ -359,6 +370,11 @@ class KeyboardHook:
 
     def is_alive(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
+
+    def recording_channel(self, session_id: object) -> RecordingChannel | None:
+        if session_id != self._recording_session_id:
+            return None
+        return self._recording_channel
 
     def start(self, timeout: float = 1.0) -> None:
         timeout = _require_finite_timeout(timeout, "start")
@@ -671,11 +687,22 @@ class KeyboardHook:
             self._fail_open("command", exc)
             accepted = False
 
+        recording_session_id = None
+        held_keys = frozenset()
+        recording_channel = None
+        if accepted and command.kind is CommandKind.ENTER_RECORDING:
+            recording_session_id = self._recording_session_id
+            held_keys = frozenset(self.state.pressed)
+            recording_channel = self._recording_channel
+
         result = CommandResult(
             command.command_id,
             accepted,
             self.locked,
             self.shortcut_generation,
+            recording_session_id,
+            held_keys,
+            recording_channel,
         )
         if command.reply is not None:
             command.reply.put(result)
@@ -683,6 +710,7 @@ class KeyboardHook:
     def _run_command(self, command: HookCommand) -> bool:
         if command.kind is CommandKind.STOP:
             self._intentional_stop.set()
+            self._end_recording(invalidate=True)
             self._force_fail_open_unlocked()
             self._stop_requested.set()
             accepted = self._unhook_owner()
@@ -698,7 +726,7 @@ class KeyboardHook:
         if command.kind is CommandKind.SET_LOCKED:
             committed, transition = self._commit_state_command(
                 command,
-                lambda: self.state.set_locked(bool(command.payload))
+                lambda: self._set_locked_command(bool(command.payload))
             )
             if not committed:
                 return False
@@ -706,13 +734,14 @@ class KeyboardHook:
         if command.kind is CommandKind.TOGGLE:
             committed, transition = self._commit_state_command(
                 command,
-                lambda: self.state.set_locked(not self.state.locked)
+                lambda: self._set_locked_command(not self.state.locked)
             )
             if not committed:
                 return False
             return True
         if command.kind is CommandKind.REPLACE_SHORTCUT:
             def replace_shortcut():
+                self._end_recording(invalidate=True)
                 accepted = self.state.replace_shortcut(command.payload)
                 if accepted:
                     self.shortcut_generation += 1
@@ -723,15 +752,78 @@ class KeyboardHook:
                 return False
             return accepted
         if command.kind is CommandKind.ENTER_RECORDING:
-            committed, accepted = self._commit_command(
-                command,
-                self.state.enter_recording
-            )
+            committed, accepted = self._commit_command(command, self._begin_recording)
             return committed and accepted
         if command.kind is CommandKind.EXIT_RECORDING:
-            committed, _ = self._commit_command(command, self.state.exit_recording)
+            committed, _ = self._commit_command(
+                command,
+                lambda: self._finish_or_exit_recording(command.payload),
+            )
             return committed
+        if command.kind is CommandKind.CANCEL_RECORDING:
+            committed, accepted = self._commit_command(
+                command,
+                lambda: self._cancel_recording(command.payload),
+            )
+            return committed and accepted
+        if command.kind is CommandKind.FINISH_RECORDING:
+            committed, accepted = self._commit_command(
+                command,
+                lambda: self._finish_recording(command.payload),
+            )
+            return committed and accepted
         return False
+
+    def _begin_recording(self) -> bool:
+        if self._recording_channel is not None:
+            return False
+        if not self.state.enter_recording():
+            return False
+        session_id = self._next_recording_session_id
+        self._next_recording_session_id += 1
+        self._recording_session_id = session_id
+        self._recording_channel = RecordingChannel(
+            session_id,
+            capacity=self.recording_capacity,
+        )
+        return True
+
+    def _finish_or_exit_recording(self, session_id) -> bool:
+        if session_id is None:
+            self._end_recording(invalidate=True)
+            return True
+        return self._finish_recording(session_id)
+
+    def _finish_recording(self, session_id) -> bool:
+        channel = self._recording_channel
+        if channel is None or session_id != self._recording_session_id:
+            return False
+        if not channel.status.healthy:
+            self._end_recording(invalidate=True)
+            return False
+        self._end_recording(invalidate=False)
+        return True
+
+    def _cancel_recording(self, session_id) -> bool:
+        if self._recording_channel is None or session_id != self._recording_session_id:
+            return False
+        self._end_recording(invalidate=True)
+        return True
+
+    def _end_recording(self, *, invalidate: bool) -> None:
+        channel = self._recording_channel
+        if channel is not None:
+            if invalidate:
+                channel.invalidate()
+            else:
+                channel.close()
+        self._recording_channel = None
+        self._recording_session_id = None
+        self.state.exit_recording()
+
+    def _set_locked_command(self, locked: bool):
+        self._end_recording(invalidate=True)
+        return self.state.set_locked(locked)
 
     def _commit_command(self, command: HookCommand, operation):
         if self._fail_open_active():
@@ -800,7 +892,9 @@ class KeyboardHook:
     ) -> None:
         transition = None
         try:
+            self._end_recording(invalidate=True)
             transition = self.state.set_locked(False)
+            self.state.reset_runtime()
         except BaseException:
             try:
                 self.state.locked = False
@@ -864,6 +958,9 @@ class KeyboardHook:
             self._publish_snapshot()
             if transition.changed:
                 self._publish_transition(transition)
+            recording_channel = self._recording_channel
+            if recording_channel is not None:
+                recording_channel.publish(event)
             if self._fail_open_active():
                 return self._call_next_or_zero(n_code, w_param, l_param)
             if transition.suppress:

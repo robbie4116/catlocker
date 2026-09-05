@@ -580,6 +580,130 @@ def test_commands_are_serialized_on_hook_thread():
         hook.stop(timeout=1)
 
 
+def test_recording_session_is_acknowledged_and_old_commands_cannot_touch_new_session():
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        first = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+        assert first.accepted is True
+        assert first.recording_session_id is not None
+        assert first.held_keys == frozenset()
+        assert first.recording_channel.status.healthy is True
+
+        api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x41))
+        records = first.recording_channel.drain()
+        assert len(records) == 1
+        assert records[0].session_id == first.recording_session_id
+        assert records[0].event.vk == 0x41
+        assert hook.events.empty()
+
+        assert hook.submit(
+            CommandKind.FINISH_RECORDING,
+            first.recording_session_id,
+            timeout=1,
+        ).accepted is True
+
+        second = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+        assert second.accepted is True
+        assert second.recording_session_id != first.recording_session_id
+        assert hook.submit(
+            CommandKind.FINISH_RECORDING,
+            first.recording_session_id,
+            timeout=1,
+        ).accepted is False
+        assert hook.submit(
+            CommandKind.CANCEL_RECORDING,
+            second.recording_session_id,
+            timeout=1,
+        ).accepted is True
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_recording_overflow_is_sticky_and_prevents_finish():
+    api = FakeWin32Api()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api, recording_capacity=1)
+    hook.start(timeout=1)
+    try:
+        result = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+        api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x41))
+        api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x42))
+
+        assert result.recording_channel.status.overflowed is True
+        assert hook.submit(
+            CommandKind.FINISH_RECORDING,
+            result.recording_session_id,
+            timeout=1,
+        ).accepted is False
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_recording_cancel_is_session_specific_and_idempotent():
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        first = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+        assert hook.submit(
+            CommandKind.CANCEL_RECORDING,
+            first.recording_session_id,
+            timeout=1,
+        ).accepted is True
+        assert hook.submit(
+            CommandKind.CANCEL_RECORDING,
+            first.recording_session_id,
+            timeout=1,
+        ).accepted is False
+
+        second = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+        assert hook.submit(
+            CommandKind.CANCEL_RECORDING,
+            first.recording_session_id,
+            timeout=1,
+        ).accepted is False
+        assert hook.submit(
+            CommandKind.CANCEL_RECORDING,
+            second.recording_session_id,
+            timeout=1,
+        ).accepted is True
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_external_lock_invalidates_recording_session_and_channel():
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    try:
+        result = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+
+        assert hook.submit(CommandKind.SET_LOCKED, True, timeout=1).accepted is True
+
+        assert result.recording_channel.status.invalid is True
+        assert hook.recording_channel(result.recording_session_id) is None
+        assert hook.state.recording is False
+    finally:
+        hook.stop(timeout=1)
+
+
+def test_overflow_after_candidate_event_is_rejected_by_finish():
+    api = FakeWin32Api()
+    hook = KeyboardHook(parse_shortcut("F24"), api=api, recording_capacity=1)
+    hook.start(timeout=1)
+    try:
+        result = hook.submit(CommandKind.ENTER_RECORDING, timeout=1)
+        api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x41))
+        api.emit(HC_ACTION, WM_KEYUP, KBDLLHOOKSTRUCT(vkCode=0x41))
+
+        assert result.recording_channel.status.overflowed is True
+        assert hook.submit(
+            CommandKind.FINISH_RECORDING,
+            result.recording_session_id,
+            timeout=1,
+        ).accepted is False
+    finally:
+        hook.stop(timeout=1)
+
+
 def test_callback_exception_poisoning_passes_all_later_events(monkeypatch):
     api = FakeWin32Api()
     hook = started_hook(api, "F24")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+from dataclasses import dataclass
 
 from hotkeys import Shortcut
 from keyboard_hook import (
@@ -11,10 +12,18 @@ from keyboard_hook import (
     HookTimeout,
     KeyboardHook,
 )
+from recording_channel import RecordingChannel
 
 
 class EngineUnhealthy(RuntimeError):
     """Raised when the keyboard hook can no longer acknowledge a command."""
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingSession:
+    session_id: object
+    held_keys: frozenset[int]
+    channel: RecordingChannel
 
 
 class CatModeController:
@@ -50,8 +59,29 @@ class CatModeController:
     def enter_recording(self) -> bool:
         return self._submit(CommandKind.ENTER_RECORDING).accepted
 
+    def begin_recording(self) -> RecordingSession | None:
+        result = self._submit(CommandKind.ENTER_RECORDING)
+        if not result.accepted:
+            return None
+        if (
+            result.recording_session_id is None
+            or result.recording_channel is None
+        ):
+            raise EngineUnhealthy("Keyboard engine returned no recording session.")
+        return RecordingSession(
+            result.recording_session_id,
+            result.held_keys,
+            result.recording_channel,
+        )
+
     def exit_recording(self) -> bool:
         return self._submit(CommandKind.EXIT_RECORDING).accepted
+
+    def finish_recording(self, session_id: object) -> bool:
+        return self._submit(CommandKind.FINISH_RECORDING, session_id).accepted
+
+    def cancel_recording(self, session_id: object) -> bool:
+        return self._submit(CommandKind.CANCEL_RECORDING, session_id).accepted
 
     def enter_fail_open(self) -> None:
         self.hook.enter_fail_open()
