@@ -3,6 +3,7 @@ import pytest
 
 from hotkeys import Shortcut, ShortcutError, parse_shortcut
 from hotkeys import (
+    ActivationKind,
     Modifier,
     VK_LCONTROL,
     VK_LMENU,
@@ -10,6 +11,7 @@ from hotkeys import (
     VK_LWIN,
     VK_RCONTROL,
     active_modifier_families,
+    format_shortcut,
     shortcut_from_pressed_vks,
     validate_shortcut,
 )
@@ -131,17 +133,18 @@ def test_extra_modifier_family_prevents_a_match():
     assert not shortcut.matches({VK_LCONTROL, VK_LSHIFT, VK_LMENU}, 0x4B)
 
 
-def test_recorded_physical_keys_normalize_to_generic_modifier_families():
+def test_recorded_physical_keys_preserve_modifier_sides():
     shortcut = shortcut_from_pressed_vks(
         {VK_RCONTROL, 0xA1, 0x4B},
         trigger_vk=0x4B,
     )
-    assert shortcut.canonical == "Ctrl+Shift+K"
+    assert shortcut.canonical == "RCtrl+RShift+K"
 
 
-def test_recorder_rejects_modifier_only_and_unknown_trigger():
-    with pytest.raises(ShortcutError):
-        shortcut_from_pressed_vks({VK_LCONTROL}, trigger_vk=VK_LCONTROL)
+def test_recorder_accepts_one_side_specific_modifier_and_rejects_unknown_trigger():
+    assert shortcut_from_pressed_vks(
+        {VK_LCONTROL}, trigger_vk=VK_LCONTROL
+    ).canonical == "LCtrl"
     with pytest.raises(ShortcutError):
         shortcut_from_pressed_vks({0xFF}, trigger_vk=0xFF)
 
@@ -188,3 +191,127 @@ def test_format_pressed_vks_uses_full_modifier_order():
     }
 
     assert formatter(pressed) == "Ctrl+Alt+Shift+Win+K"
+
+
+def test_side_specific_shortcut_round_trip():
+    shortcut = parse_shortcut("LCtrl + K")
+
+    assert shortcut.canonical == "LCtrl+K"
+    assert parse_shortcut(shortcut.canonical) == shortcut
+    assert format_shortcut(shortcut) == "LCtrl + K"
+
+
+def test_legacy_shortcut_keeps_generic_tokens():
+    shortcut = parse_shortcut("Ctrl+Shift+K")
+
+    assert shortcut.canonical == "Ctrl+Shift+K"
+    assert format_shortcut(shortcut) == "Ctrl + Shift + K"
+
+
+@pytest.mark.parametrize(
+    ("token", "vk"),
+    [
+        ("LCtrl", VK_LCONTROL),
+        ("RCtrl", VK_RCONTROL),
+        ("LAlt", VK_LMENU),
+        ("RAlt", 0xA5),
+        ("LShift", VK_LSHIFT),
+        ("RShift", 0xA1),
+        ("LWin", VK_LWIN),
+        ("RWin", 0x5C),
+    ],
+)
+def test_all_side_specific_modifiers_parse_as_exact_requirements(token, vk):
+    shortcut = parse_shortcut(token)
+
+    assert shortcut.is_standalone is True
+    assert shortcut.activation_kind is ActivationKind.RELEASE
+    assert shortcut.trigger_vk == vk
+    assert shortcut.canonical == token
+    assert format_shortcut(shortcut) == token
+
+
+def test_both_sides_of_one_family_are_ordered_before_the_trigger():
+    shortcut = parse_shortcut("K+RCtrl+LCtrl")
+
+    assert shortcut.canonical == "LCtrl+RCtrl+K"
+    assert shortcut.matches({VK_LCONTROL, VK_RCONTROL}, 0x4B)
+    assert not shortcut.matches({VK_LCONTROL}, 0x4B)
+
+
+def test_exact_side_matching_rejects_wrong_side_both_sides_and_extra_family():
+    shortcut = parse_shortcut("LCtrl+K")
+
+    assert shortcut.matches({VK_LCONTROL}, 0x4B)
+    assert not shortcut.matches({VK_RCONTROL}, 0x4B)
+    assert not shortcut.matches({VK_LCONTROL, VK_RCONTROL}, 0x4B)
+    assert not shortcut.matches({VK_LCONTROL, VK_LSHIFT}, 0x4B)
+
+
+def test_legacy_generic_matching_accepts_left_right_or_both_sides():
+    shortcut = parse_shortcut("Ctrl+K")
+
+    assert shortcut.matches({VK_LCONTROL}, 0x4B)
+    assert shortcut.matches({VK_RCONTROL}, 0x4B)
+    assert shortcut.matches({VK_LCONTROL, VK_RCONTROL}, 0x4B)
+
+
+@pytest.mark.parametrize(
+    ("raw", "canonical", "vk"),
+    [
+        ("OEM_1", "OEM_1", 0xBA),
+        ("OEM_PLUS", "OEM_PLUS", 0xBB),
+        ("OEM_COMMA", "OEM_COMMA", 0xBC),
+        ("OEM_MINUS", "OEM_MINUS", 0xBD),
+        ("OEM_PERIOD", "OEM_PERIOD", 0xBE),
+        ("OEM_2", "OEM_2", 0xBF),
+        ("OEM_3", "OEM_3", 0xC0),
+        ("OEM_4", "OEM_4", 0xDB),
+        ("OEM_5", "OEM_5", 0xDC),
+        ("OEM_6", "OEM_6", 0xDD),
+        ("OEM_7", "OEM_7", 0xDE),
+        ("OEM_102", "OEM_102", 0xE2),
+    ],
+)
+def test_oem_punctuation_round_trips_with_stable_tokens(raw, canonical, vk):
+    shortcut = parse_shortcut(raw)
+
+    assert shortcut.canonical == canonical
+    assert shortcut.trigger_vk == vk
+    assert parse_shortcut(shortcut.canonical) == shortcut
+
+
+def test_shifted_punctuation_uses_shift_token_and_safe_oem_trigger():
+    shortcut = parse_shortcut("LShift+OEM_PLUS")
+
+    assert shortcut.canonical == "LShift+OEM_PLUS"
+    assert "+" not in shortcut.trigger_name
+    assert format_shortcut(shortcut) == "LShift + +"
+
+
+@pytest.mark.parametrize("raw", ["Ctrl", "Alt", "Shift", "Win"])
+def test_generic_standalone_modifiers_are_invalid(raw):
+    with pytest.raises(ShortcutError, match="side"):
+        parse_shortcut(raw)
+
+
+@pytest.mark.parametrize("raw", ["Ctrl+LCtrl+K", "LCtrl+Ctrl+K"])
+def test_generic_and_specific_same_family_are_ambiguous(raw):
+    with pytest.raises(ShortcutError, match="ambiguous"):
+        parse_shortcut(raw)
+
+
+def test_exact_modifiers_in_different_families_can_mix_with_generic_family():
+    shortcut = parse_shortcut("Ctrl+RAlt+K")
+
+    assert shortcut.canonical == "Ctrl+RAlt+K"
+    assert shortcut.matches({VK_LCONTROL, 0xA5}, 0x4B)
+    assert not shortcut.matches({VK_RCONTROL, VK_LMENU}, 0x4B)
+
+
+def test_side_specific_system_shortcut_still_warns_and_secure_shortcut_is_rejected():
+    warning = validate_shortcut(parse_shortcut("RAlt+Tab"))
+    assert warning.warnings == (hotkeys.SYSTEM_WARNING,)
+
+    with pytest.raises(ShortcutError, match="secure"):
+        validate_shortcut(parse_shortcut("LCtrl+RAlt+Delete"))

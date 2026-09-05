@@ -79,6 +79,15 @@ def test_atomic_save_round_trips_and_leaves_no_temp_file(tmp_path):
     assert list(tmp_path.glob(".catlocker-*.tmp")) == []
 
 
+@pytest.mark.parametrize("hotkey", ["RAlt", "LCtrl+OEM_3", "Ctrl+Shift+K"])
+def test_new_and_legacy_shortcuts_round_trip_without_rewriting_tokens(tmp_path, hotkey):
+    path = tmp_path / "config.toml"
+
+    save_settings(path, AppSettings(hotkey, False))
+
+    assert load_settings(path) == AppSettings(hotkey, False)
+
+
 def test_replace_failure_preserves_previous_file_and_cleans_temp(tmp_path):
     path = tmp_path / "config.toml"
     save_settings(path, AppSettings())
