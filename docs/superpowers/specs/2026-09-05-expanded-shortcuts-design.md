@@ -2,7 +2,7 @@
 
 Date: 2026-09-05
 
-Status: Behavior approved in conversation; written spec awaiting user review.
+Status: Approved by the user for implementation planning on 2026-09-05. Implementation belongs in a separate task.
 
 ## Purpose and scope
 
