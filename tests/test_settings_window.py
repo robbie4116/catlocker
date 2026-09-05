@@ -7,8 +7,10 @@ import hotkeys
 import pytest
 import settings_window as settings_window_module
 
-from controller import EngineUnhealthy
+from controller import EngineUnhealthy, RecordingSession
 from hotkeys import ShortcutError, VK_LCONTROL
+from hotkeys import KeyEvent, VK_RMENU, VK_LCONTROL, VK_LSHIFT
+from recording_channel import RecordingChannel
 from settings import AppSettings
 from settings_window import (
     SettingsCoordinator,
@@ -72,6 +74,48 @@ class FakeController:
 
     def enter_fail_open(self):
         self.fail_open_calls += 1
+
+
+class NativeFakeController(FakeController):
+    def __init__(self, calls, *, held_keys=frozenset(), recording_capacity=256, **kwargs):
+        super().__init__(calls, **kwargs)
+        self.held_keys = frozenset(held_keys)
+        self.recording_capacity = recording_capacity
+        self._session_number = 0
+        self.session = None
+        self.finish_result = True
+
+    def begin_recording(self):
+        self._session_number += 1
+        self.calls.append(("begin_recording", self._session_number))
+        channel = RecordingChannel(
+            self._session_number,
+            capacity=self.recording_capacity,
+        )
+        self.session = RecordingSession(
+            self._session_number,
+            self.held_keys,
+            channel,
+        )
+        return self.session
+
+    def finish_recording(self, session_id):
+        self.calls.append(("finish_recording", session_id))
+        if self.session is None or self.session.session_id != session_id:
+            return False
+        if not self.finish_result:
+            return False
+        self.session.channel.close()
+        self.session = None
+        return True
+
+    def cancel_recording(self, session_id):
+        self.calls.append(("cancel_recording", session_id))
+        if self.session is None or self.session.session_id != session_id:
+            return False
+        self.session.channel.invalidate()
+        self.session = None
+        return True
 
 
 class FakeStartupRegistry:
@@ -262,7 +306,7 @@ def test_recording_enters_only_after_controller_ack_and_ignores_repeat():
     assert coordinator.record_keydown(VK_LCONTROL) is None
     shortcut = coordinator.record_keydown(0x4B)
 
-    assert shortcut.canonical == "Ctrl+K"
+    assert shortcut.canonical == "LCtrl+K"
     assert calls == [
         ("enter_recording", None),
         ("exit_recording", None),
@@ -312,12 +356,12 @@ def test_coordinator_exposes_live_recording_text_and_clears_after_completion():
     assert coordinator.begin_recording() is True
     assert coordinator.recording_text == ""
     coordinator.record_keydown(VK_LCONTROL)
-    assert coordinator.recording_text == "Ctrl"
+    assert coordinator.recording_text == "LCtrl"
     coordinator.record_keydown(hotkeys.VK_LSHIFT)
-    assert coordinator.recording_text == "Ctrl+Shift"
+    assert coordinator.recording_text == "LCtrl+LShift"
     shortcut = coordinator.record_keydown(0x4B)
 
-    assert shortcut.canonical == "Ctrl+Shift+K"
+    assert shortcut.canonical == "LCtrl+LShift+K"
     assert coordinator.recording_text == ""
 
 
@@ -329,18 +373,19 @@ def test_recording_preview_requires_new_trigger_after_releasing_unknown_extra_ke
     coordinator.record_keydown(0x4B)
 
     assert coordinator.recording is True
-    assert coordinator.recording_text == "Ctrl+K+VK_FF"
+    assert coordinator.recording_text == "LCtrl+K+VK_FF"
 
     coordinator.record_keyup(0xFF)
 
     assert coordinator.recording is True
-    assert coordinator.recording_text == "Ctrl+K"
+    assert coordinator.recording_text == "LCtrl+K"
     coordinator.record_keyup(0x4B)
+    coordinator.record_keyup(VK_LCONTROL)
     assert coordinator.recording is True
 
     shortcut = coordinator.record_keydown(0x4B)
 
-    assert shortcut.canonical == "Ctrl+K"
+    assert shortcut.canonical == "K"
     assert coordinator.recording is False
 
 
@@ -539,6 +584,26 @@ class FakeTkVariable:
         self.value = value
 
 
+class FakeTkRoot:
+    def __init__(self):
+        self.callbacks = {}
+        self._next_callback = 1
+
+    def after(self, _delay, callback):
+        callback_id = f"after-{self._next_callback}"
+        self._next_callback += 1
+        self.callbacks[callback_id] = callback
+        return callback_id
+
+    def after_cancel(self, callback_id):
+        self.callbacks.pop(callback_id, None)
+
+    def run_next_after(self):
+        callback_id, callback = next(iter(self.callbacks.items()))
+        self.callbacks.pop(callback_id)
+        callback()
+
+
 def dispatch_child_event(child, parent, sequence, event):
     child_or_parent_returned_break = False
     for (bound_sequence, _binding_id), callback in child.bindings.items():
@@ -609,6 +674,8 @@ def make_settings_window(
     on_engine_unhealthy=None,
     on_startup_result=None,
     coordinator=None,
+    root=None,
+    key_label_resolver=None,
 ):
     import settings_window as settings_window_module
 
@@ -617,8 +684,9 @@ def make_settings_window(
     monkeypatch.setitem(sys.modules, "tkinter.messagebox", messagebox)
     coordinator = coordinator or make_coordinator([])
     return settings_window_module.SettingsWindow(
-        object(),
+        root or object(),
         coordinator,
+        key_label_resolver=key_label_resolver,
         on_engine_unhealthy=on_engine_unhealthy,
         on_startup_result=on_startup_result,
     )
@@ -668,14 +736,14 @@ def test_view_updates_live_preview():
     assert view.begin_recording() is True
     assert view.hotkey_text == ""
     view.on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
-    assert view.hotkey_text == "Ctrl"
+    assert view.hotkey_text == "LCtrl"
     view.on_key_press(FakeTkEvent(0xFF, keysym="Shift_L"))
-    assert view.hotkey_text == "Ctrl+Shift"
+    assert view.hotkey_text == "LCtrl + LShift"
     view.on_key_release(FakeTkEvent(0xFE, keysym="Shift_L"))
-    assert view.hotkey_text == "Ctrl"
+    assert view.hotkey_text == "LCtrl"
     view.on_key_press(FakeTkEvent(0x4B, keysym="k"))
 
-    assert view.hotkey_text == "Ctrl+K"
+    assert view.hotkey_text == "LCtrl + K"
     assert view.recording is False
 
 
@@ -714,7 +782,7 @@ def test_view_cancel_restores_accepted():
 
     view.begin_recording()
     view.on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
-    assert view.hotkey_text == "Ctrl"
+    assert view.hotkey_text == "LCtrl"
 
     view.cancel_recording()
 
@@ -1065,14 +1133,14 @@ def test_settings_window_readonly_entry_rejects_direct_text_but_accepts_programm
     assert window.hotkey_var.get() == "Ctrl+Shift+K"
 
 
-def test_settings_window_save_synchronizes_programmatic_display_value(monkeypatch):
+def test_settings_window_save_ignores_programmatic_display_value(monkeypatch):
     window = make_settings_window(monkeypatch)
 
     window.hotkey_var.set("K")
     window._save()
 
-    assert window.view.hotkey_text == "K"
-    assert window.view.coordinator.current.toggle_hotkey == "K"
+    assert window.view.hotkey_text == "F24"
+    assert window.view.coordinator.current.toggle_hotkey == "F24"
 
 
 def test_settings_window_dispatch(monkeypatch):
@@ -1104,7 +1172,7 @@ def test_settings_window_dispatch(monkeypatch):
     assert other_child_result == "break"
     assert len(calls) == 2
     assert window.hotkey_entry.configured["state"] == "readonly"
-    assert window.view.hotkey_text == "Ctrl+Shift"
+    assert window.view.hotkey_text == "LCtrl + LShift"
 
 
 def test_settings_window_handlers_return_break_and_synchronize(monkeypatch):
@@ -1149,8 +1217,8 @@ def test_settings_window_handlers_return_break_and_synchronize(monkeypatch):
         == "break"
     )
 
-    assert window.hotkey_var.set_calls == ["Ctrl", "Ctrl+Shift", "Ctrl", "Ctrl+K"]
-    assert window.hotkey_var.get() == "Ctrl+K"
+    assert window.hotkey_var.set_calls == ["LCtrl", "LCtrl + LShift", "LCtrl", "LCtrl + K"]
+    assert window.hotkey_var.get() == "LCtrl + K"
     assert window.hotkey_entry.configured["state"] == "readonly"
     assert window.hotkey_entry.bindings == {}
     assert window.window.bindings == {}
@@ -1527,3 +1595,149 @@ def test_settings_window_close_failure_restores_and_withdraws(monkeypatch, error
     else:
         assert fatal_errors == []
         assert ordinary_errors == [error]
+
+
+def make_native_window(
+    monkeypatch,
+    *,
+    calls=None,
+    held_keys=frozenset(),
+    recording_capacity=256,
+    key_label_resolver=None,
+):
+    calls = [] if calls is None else calls
+    controller = NativeFakeController(
+        calls,
+        held_keys=held_keys,
+        recording_capacity=recording_capacity,
+    )
+    coordinator = SettingsCoordinator(
+        AppSettings(),
+        controller,
+        lambda settings: calls.append(("persist", settings)),
+        FakeStartupRegistry(),
+        lambda enabled: calls.append(("notifications", enabled)),
+    )
+    root = FakeTkRoot()
+    window = make_settings_window(
+        monkeypatch,
+        coordinator=coordinator,
+        root=root,
+        key_label_resolver=key_label_resolver,
+    )
+    return window, controller, root, calls
+
+
+def test_native_recording_uses_hook_stream_and_completes_standalone_on_release(monkeypatch):
+    window, controller, _root, calls = make_native_window(monkeypatch)
+
+    window._record()
+    session = controller.session
+    session.channel.publish(KeyEvent(VK_RMENU, True))
+    window._poll_recording(session.session_id)
+
+    assert window.hotkey_var.get() == "RAlt"
+    assert window.view.recording is True
+    assert window.save_button.configured["state"] == "disabled"
+
+    session.channel.publish(KeyEvent(VK_RMENU, False))
+    window._poll_recording(session.session_id)
+
+    assert window.hotkey_var.get() == "RAlt"
+    assert window.view.recording is False
+    assert window.save_button.configured["state"] == "normal"
+    assert ("finish_recording", session.session_id) in calls
+
+
+def test_native_recording_renders_exact_side_combination_and_saves_canonical_candidate(
+    monkeypatch,
+):
+    window, controller, _root, calls = make_native_window(monkeypatch)
+
+    window._record()
+    session = controller.session
+    session.channel.publish(KeyEvent(VK_LCONTROL, True))
+    session.channel.publish(KeyEvent(VK_LSHIFT, True))
+    session.channel.publish(KeyEvent(0x4B, True))
+    window._poll_recording(session.session_id)
+
+    assert window.hotkey_var.get() == "LCtrl + LShift + K"
+    assert window.view.recording is False
+
+    window._save()
+
+    assert ("replace", "LCtrl+LShift+K") in calls
+
+
+def test_native_oem_display_uses_injected_ui_label_without_changing_canonical_value(
+    monkeypatch,
+):
+    window, controller, _root, calls = make_native_window(
+        monkeypatch,
+        key_label_resolver=lambda name: "Backtick (US)" if name == "OEM_3" else None,
+    )
+    window._record()
+    session = controller.session
+    session.channel.publish(KeyEvent(0xC0, True))
+
+    window._poll_recording(session.session_id)
+
+    assert window.hotkey_var.get() == "Backtick (US)"
+    window._save()
+    assert ("replace", "OEM_3") in calls
+
+
+def test_native_recording_keeps_rejection_feedback_sticky_until_new_attempt(monkeypatch):
+    window, controller, _root, _calls = make_native_window(monkeypatch)
+    window._record()
+    session = controller.session
+
+    session.channel.publish(KeyEvent(0xFF, True))
+    window._poll_recording(session.session_id)
+    assert window.status_var.get() == "This key isn't supported. Try another key."
+    assert window.save_button.configured["state"] == "disabled"
+
+    session.channel.publish(KeyEvent(0xFF, False))
+    window._poll_recording(session.session_id)
+    assert window.status_var.get() == "This key isn't supported. Try another key."
+
+    session.channel.publish(KeyEvent(0x41, True))
+    window._poll_recording(session.session_id)
+
+    assert window.hotkey_var.get() == "A"
+    assert window.view.recording is False
+
+
+def test_native_settings_handlers_swallow_tk_events_without_deriving_identity(monkeypatch):
+    window, _controller, _root, _calls = make_native_window(monkeypatch)
+    window._record()
+
+    assert window._on_key_press(SimpleNamespace(keycode=0x4B, keysym="k")) == "break"
+    assert window._on_key_release(SimpleNamespace(keycode=0x4B, keysym="k")) == "break"
+    assert window.hotkey_var.get() == ""
+    assert window.view.recording is True
+
+
+def test_native_overflow_cancels_session_restores_shortcut_and_allows_retry(monkeypatch):
+    window, controller, _root, _calls = make_native_window(
+        monkeypatch,
+        recording_capacity=1,
+    )
+    window._record()
+    first = controller.session
+    first.channel.publish(KeyEvent(0x41, True))
+    first.channel.publish(KeyEvent(0x41, False))
+    window._poll_recording(first.session_id)
+
+    assert controller.session is None
+    assert window.view.recording is False
+    assert window.hotkey_var.get() == "F24"
+    assert "overflowed" in window.status_var.get()
+
+    window._record()
+    second = controller.session
+    second.channel.publish(KeyEvent(0x42, True))
+    window._poll_recording(second.session_id)
+
+    assert window.hotkey_var.get() == "B"
+    assert window.view.recording is False

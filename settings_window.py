@@ -17,10 +17,13 @@ from hotkeys import (
     VK_RSHIFT,
     VK_RWIN,
     format_pressed_vks,
+    format_shortcut,
     parse_shortcut,
     shortcut_from_pressed_vks,
     validate_shortcut,
 )
+from recording_channel import RecordingChannel
+from shortcut_recorder import ShortcutRecorder
 from settings import AppSettings
 
 
@@ -29,13 +32,15 @@ class SettingsLocked(RuntimeError):
 
 
 class MalformedTkEvent(ValueError):
-    """Raised when a Tk event has no usable fallback keycode."""
+    """Raised by the legacy test adapter when a Tk event has no keycode."""
 
 
 class WarningDeclined(RuntimeError):
     """Raised when the user declines a shortcut warning."""
 
 
+# Kept as a compatibility helper for callers that used the old view-model API.
+# SettingsWindow never uses it: native hook events are authoritative there.
 _TK_KEYSYM_TO_VK = {
     "shift_l": VK_LSHIFT,
     "shift_r": VK_RSHIFT,
@@ -57,18 +62,13 @@ _TK_KEYSYM_TO_VK = {
     "super": VK_LWIN,
     "meta": VK_LWIN,
 }
-_GENERIC_TK_KEYCODES_TO_VK = {
-    0x10: VK_LSHIFT,
-    0x11: VK_LCONTROL,
-    0x12: VK_LMENU,
-}
+_GENERIC_TK_KEYCODES_TO_VK = {0x10: VK_LSHIFT, 0x11: VK_LCONTROL, 0x12: VK_LMENU}
 
 
 def normalize_tk_event(event) -> int:
     keysym = str(getattr(event, "keysym", "") or "").strip().casefold()
     if keysym in _TK_KEYSYM_TO_VK:
         return _TK_KEYSYM_TO_VK[keysym]
-
     try:
         keycode = int(getattr(event, "keycode"))
     except (AttributeError, TypeError, ValueError) as exc:
@@ -80,6 +80,14 @@ def normalize_tk_event(event) -> int:
 class StartupUpdateResult:
     enabled: bool | None
     error: OSError | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordingUpdate:
+    preview: str
+    candidate: Shortcut | None
+    explanation: str | None
+    recording: bool
 
 
 class SettingsCoordinator:
@@ -97,7 +105,11 @@ class SettingsCoordinator:
         self._startup_registry = startup_registry
         self._apply_notifications = apply_notifications
         self._recording = False
-        self._pressed_vks: set[int] = set()
+        self._session = None
+        self._channel: RecordingChannel | None = None
+        self._recorder: ShortcutRecorder | None = None
+        self._candidate: Shortcut | None = None
+        self._explanation: str | None = None
 
     @property
     def current(self) -> AppSettings:
@@ -108,8 +120,32 @@ class SettingsCoordinator:
         return self._recording
 
     @property
+    def native_recording(self) -> bool:
+        return callable(getattr(self.controller, "begin_recording", None))
+
+    @property
+    def recording_session_id(self):
+        return None if self._session is None else self._session.session_id
+
+    @property
     def recording_text(self) -> str:
-        return format_pressed_vks(self._pressed_vks) if self._recording else ""
+        if not self._recording or self._recorder is None:
+            return ""
+        return self._recorder.held_preview
+
+    @property
+    def recording_keys(self) -> frozenset[int]:
+        if not self._recording or self._recorder is None:
+            return frozenset()
+        return self._recorder.held_keys
+
+    @property
+    def recording_explanation(self) -> str | None:
+        return self._explanation if self._recorder is None else self._recorder.explanation
+
+    @property
+    def pending_shortcut(self) -> Shortcut | None:
+        return self._candidate
 
     def save(
         self,
@@ -121,15 +157,17 @@ class SettingsCoordinator:
         if self.controller.locked:
             raise SettingsLocked("Settings are unavailable while Cat Mode is locked.")
 
-        if not isinstance(toggle_hotkey, str):
-            raise ShortcutError("A shortcut must be text.")
-        validation = validate_shortcut(parse_shortcut(toggle_hotkey))
+        if self._recording:
+            self.end_recording()
+        shortcut = self._candidate
+        if shortcut is None:
+            if not isinstance(toggle_hotkey, str):
+                raise ShortcutError("A shortcut must be text.")
+            shortcut = validate_shortcut(parse_shortcut(toggle_hotkey)).shortcut
+        validation = validate_shortcut(shortcut)
         if validation.warnings:
             if confirm_warning is None or not confirm_warning(validation.warnings):
                 raise WarningDeclined("Shortcut warning was not confirmed.")
-
-        if self._recording:
-            self.end_recording()
 
         candidate = AppSettings(
             toggle_hotkey=validation.shortcut.canonical,
@@ -139,7 +177,7 @@ class SettingsCoordinator:
         try:
             accepted = self.controller.replace_shortcut(validation.shortcut)
         except EngineUnhealthy:
-            self._clear_recording()
+            self._clear_candidate()
             raise
         if accepted is None:
             raise SettingsLocked("The keyboard engine rejected the shortcut.")
@@ -152,15 +190,17 @@ class SettingsCoordinator:
                     parse_shortcut(previous.toggle_hotkey)
                 )
             except EngineUnhealthy:
-                self._clear_recording()
+                self._clear_candidate()
                 raise
             if rollback is None:
-                self._clear_recording()
+                self._clear_candidate()
                 self.controller.enter_fail_open()
                 raise EngineUnhealthy("shortcut rollback rejected")
+            self._clear_candidate()
             raise
 
         self._current = candidate
+        self._clear_candidate()
         self._apply_notifications(candidate.notifications)
         return candidate
 
@@ -170,7 +210,6 @@ class SettingsCoordinator:
             self._startup_registry.set_enabled(bool(enabled))
         except OSError as exc:
             write_error = exc
-
         try:
             actual = bool(self._startup_registry.is_enabled())
         except OSError as refresh_error:
@@ -183,52 +222,167 @@ class SettingsCoordinator:
         if self._recording:
             return True
         try:
-            accepted = bool(self.controller.enter_recording())
+            begin = getattr(self.controller, "begin_recording", None)
+            if callable(begin):
+                session = begin()
+                if session is None:
+                    self._clear_recording()
+                    return False
+                self._session = session
+                self._channel = session.channel
+                held_keys = session.held_keys
+            else:
+                if not bool(self.controller.enter_recording()):
+                    self._clear_recording()
+                    return False
+                held_keys = frozenset()
+                self._channel = RecordingChannel("legacy-settings")
         except EngineUnhealthy:
             self._clear_recording()
             raise
-        if not accepted:
-            self._clear_recording()
-            return False
-        self._pressed_vks.clear()
+        self._recorder = ShortcutRecorder(
+            self.recording_session_id or "legacy-settings",
+            held_keys=held_keys,
+        )
+        self._candidate = None
+        self._explanation = None
         self._recording = True
         return True
 
+    def poll_recording(self, *, limit: int = 64) -> RecordingUpdate:
+        if not self._recording or self._recorder is None:
+            return RecordingUpdate("", self._candidate, self._explanation, False)
+        if self._channel is None:
+            return self._legacy_update()
+        status = self._channel.status
+        if not status.healthy:
+            explanation = (
+                "Recording overflowed. Try recording again."
+                if status.overflowed
+                else "Recording was cancelled. Try again."
+            )
+            self._cancel_native_recording()
+            self._explanation = explanation
+            return RecordingUpdate("", None, explanation, False)
+
+        for envelope in self._channel.drain(limit=limit):
+            if envelope.session_id != self.recording_session_id:
+                continue
+            self._recorder.consume(envelope.event)
+        if self._recorder.candidate is not None:
+            status = self._channel.status
+            if not status.healthy:
+                return self._reject_unhealthy_recording(status)
+            try:
+                accepted = bool(self.controller.finish_recording(self.recording_session_id))
+            except EngineUnhealthy:
+                self._clear_recording()
+                raise
+            if not accepted:
+                self._clear_recording()
+                self._explanation = "Recording could not be completed. Try again."
+                return RecordingUpdate("", None, self._explanation, False)
+            self._candidate = self._recorder.candidate
+            preview = self._recorder.held_preview
+            self._session = None
+            self._channel = None
+            self._recording = False
+            return RecordingUpdate(preview, self._candidate, None, False)
+        return RecordingUpdate(
+            self.recording_text,
+            None,
+            self._recorder.explanation,
+            True,
+        )
+
+    def _legacy_update(self) -> RecordingUpdate:
+        return RecordingUpdate(
+            self.recording_text,
+            self._recorder.candidate if self._recorder else None,
+            self.recording_explanation,
+            self._recording,
+        )
+
+    def _reject_unhealthy_recording(self, status) -> RecordingUpdate:
+        explanation = (
+            "Recording overflowed. Try recording again."
+            if status.overflowed
+            else "Recording was cancelled. Try again."
+        )
+        self._cancel_native_recording()
+        self._explanation = explanation
+        return RecordingUpdate("", None, explanation, False)
+
     def record_keydown(self, vk: int) -> Shortcut | None:
-        if not self._recording:
+        """Compatibility path used only by legacy non-native test doubles."""
+        if not self._recording or self._recorder is None:
             return None
-        vk = int(vk)
-        if vk in self._pressed_vks:
+        from hotkeys import KeyEvent
+
+        self._recorder.consume(KeyEvent(int(vk), True))
+        return self._complete_legacy_candidate()
+
+    def record_keyup(self, vk: int) -> Shortcut | None:
+        if not self._recording or self._recorder is None:
             return None
-        self._pressed_vks.add(vk)
-        if vk in SUPPORTED_MODIFIER_VKS:
+        from hotkeys import KeyEvent
+
+        self._recorder.consume(KeyEvent(int(vk), False))
+        return self._complete_legacy_candidate()
+
+    def _complete_legacy_candidate(self) -> Shortcut | None:
+        if self._recorder is None or self._recorder.candidate is None:
             return None
         try:
-            shortcut = shortcut_from_pressed_vks(
-                self._pressed_vks,
-                trigger_vk=vk,
-            )
-        except ShortcutError:
-            return None
-        self.end_recording()
-        return shortcut
-
-    def record_keyup(self, vk: int) -> None:
-        if self._recording:
-            self._pressed_vks.discard(int(vk))
+            accepted = bool(self.controller.exit_recording())
+        except EngineUnhealthy:
+            self._clear_recording()
+            raise
+        candidate = self._recorder.candidate
+        self._recording = False
+        self._channel = None
+        self._session = None
+        if accepted:
+            self._candidate = candidate
+            return candidate
+        return candidate
 
     def end_recording(self) -> bool:
+        if not self._recording:
+            return True
         try:
-            return bool(self.controller.exit_recording())
+            if self._session is not None:
+                result = bool(self.controller.cancel_recording(self._session.session_id))
+            else:
+                result = bool(self.controller.exit_recording())
         except EngineUnhealthy:
             self._clear_recording()
             raise
         finally:
             self._clear_recording()
+        return result
+
+    def discard_candidate(self) -> None:
+        self._candidate = None
+
+    def _cancel_native_recording(self) -> None:
+        session = self._session
+        if session is not None:
+            try:
+                self.controller.cancel_recording(session.session_id)
+            except EngineUnhealthy:
+                self._clear_recording()
+                raise
+        self._clear_recording()
+
+    def _clear_candidate(self) -> None:
+        self._candidate = None
 
     def _clear_recording(self) -> None:
         self._recording = False
-        self._pressed_vks.clear()
+        self._session = None
+        self._channel = None
+        self._recorder = None
 
 
 class SettingsViewModel:
@@ -237,14 +391,22 @@ class SettingsViewModel:
         coordinator: SettingsCoordinator,
         *,
         startup_enabled: bool = False,
+        key_label_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         self.coordinator = coordinator
-        self.hotkey_text = coordinator.current.toggle_hotkey
+        self._key_label_resolver = key_label_resolver
+        self._accepted_canonical = coordinator.current.toggle_hotkey
+        self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
         self.notifications = coordinator.current.notifications
         self.startup_enabled = bool(startup_enabled)
-        self._accepted_hotkey = self.hotkey_text
         self._recording = False
         self._locked = bool(coordinator.controller.locked)
+
+    def _display_shortcut(self, shortcut: Shortcut) -> str:
+        return format_shortcut(
+            shortcut,
+            key_label_resolver=self._key_label_resolver,
+        )
 
     @property
     def locked(self) -> bool:
@@ -284,28 +446,56 @@ class SettingsViewModel:
         self.hotkey_text = ""
         return True
 
-    def on_key_press(self, event) -> Shortcut | None:
+    def refresh_recording(self) -> RecordingUpdate:
         if not self._recording:
+            return RecordingUpdate("", self.coordinator.pending_shortcut, None, False)
+        update = self.coordinator.poll_recording()
+        if update.candidate is not None:
+            self.hotkey_text = self._display_shortcut(update.candidate)
+            self._recording = False
+        elif update.recording:
+            preview = format_pressed_vks(
+                self.coordinator.recording_keys,
+                preserve_modifier_sides=True,
+                key_label_resolver=self._key_label_resolver,
+            )
+            self.hotkey_text = preview.replace("+", " + ")
+        else:
+            self._recording = False
+            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
+        return update
+
+    def on_key_press(self, event) -> Shortcut | None:
+        if not self._recording or self.coordinator.native_recording:
             return None
         vk = normalize_tk_event(event)
         try:
             shortcut = self.coordinator.record_keydown(vk)
         except Exception:
-            self.hotkey_text = self._accepted_hotkey
+            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             self._recording = False
             raise
-        if shortcut is None:
-            self.hotkey_text = self.coordinator.recording_text
-            return None
-        self.hotkey_text = shortcut.canonical
-        self._recording = False
+        if shortcut is not None:
+            self.hotkey_text = self._display_shortcut(shortcut)
+            self._recording = False
+        else:
+            self.hotkey_text = self.coordinator.recording_text.replace("+", " + ")
         return shortcut
 
     def on_key_release(self, event) -> None:
-        if self._recording:
+        if self._recording and not self.coordinator.native_recording:
             vk = normalize_tk_event(event)
-            self.coordinator.record_keyup(vk)
-            self.hotkey_text = self.coordinator.recording_text
+            try:
+                shortcut = self.coordinator.record_keyup(vk)
+            except Exception:
+                self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
+                self._recording = False
+                raise
+            if shortcut is not None:
+                self.hotkey_text = self._display_shortcut(shortcut)
+                self._recording = False
+            else:
+                self.hotkey_text = self.coordinator.recording_text.replace("+", " + ")
 
     def cancel_recording(self) -> None:
         if not self._recording and not self.coordinator.recording:
@@ -314,7 +504,7 @@ class SettingsViewModel:
             self.coordinator.end_recording()
         finally:
             self._recording = False
-            self.hotkey_text = self._accepted_hotkey
+            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
 
     def on_focus_out(self, _event=None) -> None:
         self.cancel_recording()
@@ -322,8 +512,9 @@ class SettingsViewModel:
     def on_close(self) -> None:
         try:
             self.cancel_recording()
+            self.coordinator.discard_candidate()
         finally:
-            self.hotkey_text = self._accepted_hotkey
+            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             self.notifications = self.coordinator.current.notifications
 
     def save(
@@ -331,21 +522,21 @@ class SettingsViewModel:
         *,
         confirm_warning: Callable[[tuple[str, ...]], bool] | None = None,
     ) -> AppSettings:
-        previous_display = self._accepted_hotkey
+        previous_display = self.hotkey_text
         if self._recording:
             self.cancel_recording()
         try:
             saved = self.coordinator.save(
-                self.hotkey_text,
+                self._accepted_canonical,
                 self.notifications,
                 confirm_warning=confirm_warning,
             )
         except Exception:
-            self.hotkey_text = previous_display
+            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             raise
-        self.hotkey_text = saved.toggle_hotkey
+        self.hotkey_text = self._display_shortcut(parse_shortcut(saved.toggle_hotkey))
         self.notifications = saved.notifications
-        self._accepted_hotkey = saved.toggle_hotkey
+        self._accepted_canonical = saved.toggle_hotkey
         return saved
 
     def set_startup_enabled(self, enabled: bool) -> StartupUpdateResult:
@@ -358,6 +549,7 @@ class SettingsViewModel:
         self._locked = bool(locked)
         if self._locked:
             self.cancel_recording()
+            self.coordinator.discard_candidate()
 
 
 class SettingsWindow:
@@ -372,6 +564,7 @@ class SettingsWindow:
         view_model: SettingsViewModel | None = None,
         on_engine_unhealthy: Callable[[EngineUnhealthy], object] | None = None,
         on_startup_result: Callable[[StartupUpdateResult], object] | None = None,
+        key_label_resolver: Callable[[str], str | None] | None = None,
     ) -> None:
         import tkinter as tk
         from tkinter import messagebox
@@ -384,21 +577,17 @@ class SettingsWindow:
         self.view = view_model or SettingsViewModel(
             coordinator,
             startup_enabled=startup_enabled,
+            key_label_resolver=key_label_resolver,
         )
+        self._native_recording = self.view.coordinator.native_recording
         self.window = tk.Toplevel(root)
         self.window.title("CatLocker Settings")
         self.window.withdraw()
         self.window.protocol("WM_DELETE_WINDOW", self._close)
 
         self.hotkey_var = tk.StringVar(self.window, value=self.view.hotkey_text)
-        self.notifications_var = tk.BooleanVar(
-            self.window,
-            value=self.view.notifications,
-        )
-        self.startup_var = tk.BooleanVar(
-            self.window,
-            value=self.view.startup_enabled,
-        )
+        self.notifications_var = tk.BooleanVar(self.window, value=self.view.notifications)
+        self.startup_var = tk.BooleanVar(self.window, value=self.view.startup_enabled)
         self.status_var = tk.StringVar(self.window, value="")
 
         frame = tk.Frame(self.window, padx=12, pady=12)
@@ -408,19 +597,11 @@ class SettingsWindow:
         self.hotkey_entry.pack(fill="x", pady=(0, 8))
         buttons = tk.Frame(frame)
         buttons.pack(fill="x")
-        self.record_button = tk.Button(
-            buttons,
-            text=self.view.record_label,
-            command=self._record,
-        )
+        self.record_button = tk.Button(buttons, text=self.view.record_label, command=self._record)
         self.record_button.pack(side="left")
         self.save_button = tk.Button(buttons, text="Save", command=self._save)
         self.save_button.pack(side="left", padx=(8, 0))
-        self.cancel_button = tk.Button(
-            buttons,
-            text="Cancel",
-            command=self._close,
-        )
+        self.cancel_button = tk.Button(buttons, text="Cancel", command=self._close)
         self.cancel_button.pack(side="right")
         tk.Checkbutton(
             frame,
@@ -436,6 +617,7 @@ class SettingsWindow:
         tk.Label(frame, textvariable=self.status_var).pack(anchor="w", pady=(8, 0))
 
         self._recording_bindings: list[tuple[object, str, str]] = []
+        self._recording_poll_id = None
         self._sync_controls()
 
     def show(self) -> None:
@@ -458,6 +640,7 @@ class SettingsWindow:
             error = exc
         finally:
             self._unbind_recording_events()
+            self._cancel_recording_poll()
             self.hotkey_var.set(self.view.hotkey_text)
             self._sync_controls()
             if locked:
@@ -491,11 +674,58 @@ class SettingsWindow:
                 return
             self.hotkey_entry.focus_set()
             self.hotkey_var.set(self.view.hotkey_text)
-            self.status_var.set("Press one shortcut combination.")
+            self.status_var.set(
+                "Press one shortcut combination. Some Fn combinations may not be detected. Try another key if nothing appears."
+            )
+            self._schedule_recording_poll()
         self._sync_controls()
 
+    def _poll_recording(self, session_id) -> None:
+        self._recording_poll_id = None
+        if not self.view.recording or session_id != self.view.coordinator.recording_session_id:
+            return
+        try:
+            update = self.view.refresh_recording()
+        except EngineUnhealthy as exc:
+            self._cleanup_recording_state()
+            self._handle_engine_unhealthy(exc)
+            return
+        except Exception as exc:
+            self._cleanup_recording_state()
+            self._show_error(exc)
+            return
+        self.hotkey_var.set(self.view.hotkey_text)
+        if update.explanation:
+            self.status_var.set(update.explanation)
+        elif update.candidate is not None:
+            self.status_var.set("Shortcut captured. Save to apply it.")
+            self._unbind_recording_events()
+        elif update.recording:
+            self.status_var.set("Press one shortcut combination.")
+        if self.view.recording:
+            self._schedule_recording_poll()
+        else:
+            self._unbind_recording_events()
+        self._sync_controls()
+
+    def _schedule_recording_poll(self) -> None:
+        after = getattr(self.root, "after", None)
+        if after is None or not self.view.recording or self._recording_poll_id is not None:
+            return
+        session_id = self.view.coordinator.recording_session_id
+        self._recording_poll_id = after(
+            10,
+            lambda sid=session_id: self._poll_recording(sid),
+        )
+
+    def _cancel_recording_poll(self) -> None:
+        callback_id = self._recording_poll_id
+        self._recording_poll_id = None
+        after_cancel = getattr(self.root, "after_cancel", None)
+        if callback_id is not None and after_cancel is not None:
+            after_cancel(callback_id)
+
     def _save(self) -> None:
-        self.view.hotkey_text = self.hotkey_var.get()
         self.view.notifications = bool(self.notifications_var.get())
 
         def confirm_warning(messages: tuple[str, ...]) -> bool:
@@ -544,6 +774,7 @@ class SettingsWindow:
             error = exc
         finally:
             self._unbind_recording_events()
+            self._cancel_recording_poll()
             self.hotkey_var.set(self.view.hotkey_text)
             self._sync_controls()
             self.window.withdraw()
@@ -553,6 +784,8 @@ class SettingsWindow:
             self._show_error(error)
 
     def _on_key_press(self, event) -> str:
+        if self._native_recording:
+            return "break"
         try:
             shortcut = self.view.on_key_press(event)
         except MalformedTkEvent:
@@ -573,6 +806,8 @@ class SettingsWindow:
         return "break"
 
     def _on_key_release(self, event) -> str:
+        if self._native_recording:
+            return "break"
         try:
             self.view.on_key_release(event)
         except MalformedTkEvent:
@@ -604,7 +839,6 @@ class SettingsWindow:
     def _bind_recording_events(self) -> None:
         if self._recording_bindings:
             return
-
         binding_specs = (
             (self.hotkey_entry, "<KeyPress>", self._on_key_press),
             (self.window, "<KeyPress>", self._on_key_press),
@@ -626,6 +860,7 @@ class SettingsWindow:
         self._recording_bindings.clear()
 
     def _cleanup_recording_state(self) -> None:
+        self._cancel_recording_poll()
         try:
             self.view.cancel_recording()
         except Exception:
