@@ -1,5 +1,7 @@
 import random
 
+import pytest
+
 from hotkeys import (
     InputState,
     KeyEvent,
@@ -230,3 +232,102 @@ def test_deterministic_cat_mashing_preserves_disposition_partition():
     assert state.pressed == set()
     assert state.passed_down == set()
     assert state.suppressed_down == set()
+
+
+@pytest.mark.parametrize(
+    "modifier",
+    [
+        "LCtrl",
+        "RCtrl",
+        "LAlt",
+        "RAlt",
+        "LShift",
+        "RShift",
+        "LWin",
+        "RWin",
+    ],
+)
+@pytest.mark.parametrize("locked", [False, True])
+def test_standalone_modifier_toggles_once_on_eligible_release(modifier, locked):
+    shortcut = parse_shortcut(modifier)
+    state = InputState(shortcut, locked=locked)
+    down_result = state.handle(down(shortcut.trigger_vk))
+
+    assert down_result.changed is False
+    assert down_result.locked is locked
+
+    up_result = state.handle(up(shortcut.trigger_vk))
+
+    assert up_result.changed is True
+    assert up_result.reason == "toggle"
+    assert up_result.locked is not locked
+    assert state.handle(up(shortcut.trigger_vk)).changed is False
+
+
+def test_standalone_modifier_does_not_toggle_after_intervening_key():
+    state = InputState(parse_shortcut("RAlt"))
+    state.handle(down(0xA5))
+    state.handle(down(0x41))
+    state.handle(up(0x41))
+
+    assert state.handle(up(0xA5)).changed is False
+
+
+def test_locked_standalone_modifier_counts_blocked_keys_for_eligibility():
+    state = InputState(parse_shortcut("LCtrl"), locked=True)
+    state.handle(down(VK_LCONTROL))
+    state.handle(down(0x41))
+    state.handle(up(0x41))
+
+    result = state.handle(up(VK_LCONTROL))
+
+    assert result.changed is False
+    assert state.locked is True
+
+
+def test_emergency_unlock_invalidates_standalone_ctrl_tap():
+    state = InputState(parse_shortcut("LCtrl"), locked=True)
+    state.handle(down(VK_LCONTROL))
+
+    assert state.handle(down(VK_RCONTROL)).reason == "emergency"
+    state.handle(up(VK_RCONTROL))
+    result = state.handle(up(VK_LCONTROL))
+
+    assert result.changed is False
+    assert state.locked is False
+
+
+@pytest.mark.parametrize("operation", ["recording", "replacement", "command"])
+def test_standalone_tap_is_invalidated_by_state_reset_operations(operation):
+    state = InputState(parse_shortcut("RAlt"))
+    state.handle(down(0xA5))
+
+    if operation == "recording":
+        assert state.enter_recording() is True
+        state.exit_recording()
+    elif operation == "replacement":
+        assert state.replace_shortcut(parse_shortcut("RAlt")) is True
+    else:
+        state.set_locked(False)
+
+    assert state.handle(up(0xA5)).changed is False
+
+
+def test_passed_standalone_modifier_release_is_delivered_when_release_locks():
+    state = InputState(parse_shortcut("RAlt"))
+
+    assert state.handle(down(0xA5)).suppress is False
+    result = state.handle(up(0xA5))
+
+    assert result.suppress is False
+    assert result.locked is True
+
+
+def test_suppressed_standalone_modifier_release_is_delivered_when_release_unlocks():
+    state = InputState(parse_shortcut("RAlt"), locked=True)
+
+    assert state.handle(down(0xA5)).suppress is True
+    result = state.handle(up(0xA5))
+
+    assert result.suppress is True
+    assert result.locked is False

@@ -217,6 +217,8 @@ class KeyEvent:
 
     @property
     def is_resolved_modifier(self) -> bool:
+        if self.vk in SUPPORTED_MODIFIER_VKS:
+            return True
         if self.modifier_family is None:
             return False
         resolved = self.resolved_vk
