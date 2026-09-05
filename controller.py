@@ -74,6 +74,9 @@ class CatModeController:
             result.recording_channel,
         )
 
+    def recording_channel(self, session_id: object) -> RecordingChannel | None:
+        return self.hook.recording_channel(session_id)
+
     def exit_recording(self) -> bool:
         return self._submit(CommandKind.EXIT_RECORDING).accepted
 

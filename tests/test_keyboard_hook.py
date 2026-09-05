@@ -26,6 +26,8 @@ from keyboard_hook import (
 )
 from hotkeys import parse_shortcut
 from controller import CatModeController, EngineUnhealthy
+from settings import AppSettings
+from settings_window import SettingsCoordinator
 
 
 class FakeWin32Api:
@@ -700,6 +702,91 @@ def test_overflow_after_candidate_event_is_rejected_by_finish():
             result.recording_session_id,
             timeout=1,
         ).accepted is False
+    finally:
+        hook.stop(timeout=1)
+
+
+@pytest.mark.parametrize(
+    ("expected", "native_events"),
+    [
+        (
+            "RAlt",
+            (
+                (WM_SYSKEYDOWN, 0x12, 0x38, 1),
+                (WM_SYSKEYUP, 0x12, 0x38, 1),
+            ),
+        ),
+        (
+            "LCtrl+K",
+            (
+                (WM_KEYDOWN, 0x11, 0x1D, 0),
+                (WM_KEYDOWN, 0x4B, 0, 0),
+                (WM_KEYUP, 0x4B, 0, 0),
+                (WM_KEYUP, 0x11, 0x1D, 0),
+            ),
+        ),
+        (
+            "OEM_3",
+            (
+                (WM_KEYDOWN, 0xC0, 0x29, 0),
+                (WM_KEYUP, 0xC0, 0x29, 0),
+            ),
+        ),
+    ],
+)
+def test_native_settings_record_save_reload_and_exact_runtime_matching(
+    expected,
+    native_events,
+):
+    api = FakeWin32Api()
+    hook = started_hook(api, "F24")
+    persisted = []
+    coordinator = SettingsCoordinator(
+        AppSettings(),
+        CatModeController(hook),
+        persisted.append,
+        type("Startup", (), {"set_enabled": lambda self, value: None, "is_enabled": lambda self: False})(),
+        lambda enabled: None,
+    )
+    try:
+        session = coordinator.begin_recording()
+        for message, vk, scan_code, flags in native_events:
+            api.emit(
+                HC_ACTION,
+                message,
+                KBDLLHOOKSTRUCT(vkCode=vk, scanCode=scan_code, flags=flags),
+            )
+
+        update = coordinator.poll_recording()
+        assert update.candidate is not None
+        assert update.candidate.canonical == expected
+        coordinator.save("F24", True)
+        assert persisted[-1] == AppSettings(expected, True)
+
+        if expected == "RAlt":
+            api.emit(HC_ACTION, WM_SYSKEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x12, scanCode=0x38, flags=1))
+            api.emit(HC_ACTION, WM_SYSKEYUP, KBDLLHOOKSTRUCT(vkCode=0x12, scanCode=0x38, flags=1))
+            assert hook.locked is True
+            api.emit(HC_ACTION, WM_SYSKEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x12, scanCode=0x38, flags=1))
+            api.emit(HC_ACTION, WM_SYSKEYUP, KBDLLHOOKSTRUCT(vkCode=0x12, scanCode=0x38, flags=1))
+            assert hook.locked is False
+            api.emit(HC_ACTION, WM_SYSKEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x12, scanCode=0x38, flags=0))
+            api.emit(HC_ACTION, WM_SYSKEYUP, KBDLLHOOKSTRUCT(vkCode=0x12, scanCode=0x38, flags=0))
+            assert hook.locked is False
+        elif expected == "LCtrl+K":
+            api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0xA2))
+            api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x4B))
+            api.emit(HC_ACTION, WM_KEYUP, KBDLLHOOKSTRUCT(vkCode=0x4B))
+            api.emit(HC_ACTION, WM_KEYUP, KBDLLHOOKSTRUCT(vkCode=0xA2))
+            assert hook.locked is True
+            api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0xA3))
+            api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0x4B))
+            api.emit(HC_ACTION, WM_KEYUP, KBDLLHOOKSTRUCT(vkCode=0x4B))
+            api.emit(HC_ACTION, WM_KEYUP, KBDLLHOOKSTRUCT(vkCode=0xA3))
+            assert hook.locked is True
+        else:
+            api.emit(HC_ACTION, WM_KEYDOWN, KBDLLHOOKSTRUCT(vkCode=0xC0))
+            assert hook.locked is True
     finally:
         hook.stop(timeout=1)
 

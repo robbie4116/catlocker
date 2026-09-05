@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import sys
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Callable
 
 from controller import EngineUnhealthy
 from hotkeys import (
-    SUPPORTED_MODIFIER_VKS,
     Shortcut,
     ShortcutError,
     VK_LCONTROL,
@@ -21,6 +23,7 @@ from hotkeys import (
     parse_shortcut,
     shortcut_from_pressed_vks,
     validate_shortcut,
+    VK_NAMES,
 )
 from recording_channel import RecordingChannel
 from shortcut_recorder import ShortcutRecorder
@@ -63,6 +66,52 @@ _TK_KEYSYM_TO_VK = {
     "meta": VK_LWIN,
 }
 _GENERIC_TK_KEYCODES_TO_VK = {0x10: VK_LSHIFT, 0x11: VK_LCONTROL, 0x12: VK_LMENU}
+
+
+@lru_cache(maxsize=1)
+def _windows_user32():
+    if sys.platform != "win32":
+        return None
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.GetKeyboardLayout.argtypes = [ctypes.c_ulong]
+    user32.GetKeyboardLayout.restype = ctypes.c_void_p
+    user32.MapVirtualKeyExW.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p]
+    user32.MapVirtualKeyExW.restype = ctypes.c_uint
+    user32.GetKeyNameTextW.argtypes = [
+        ctypes.c_long,
+        ctypes.POINTER(ctypes.c_wchar),
+        ctypes.c_int,
+    ]
+    user32.GetKeyNameTextW.restype = ctypes.c_int
+    return user32
+
+
+def windows_key_label_resolver(token: str) -> str | None:
+    """Resolve a display label on the UI thread without changing the saved token."""
+
+    user32 = _windows_user32()
+    vk = VK_NAMES.get(token)
+    if user32 is None or vk is None:
+        return None
+    scan_code = int(user32.MapVirtualKeyExW(vk, 4, user32.GetKeyboardLayout(0)))
+    if scan_code == 0:
+        return None
+    lparam = (scan_code & 0xFF) << 16
+    if scan_code & 0xFF00:
+        lparam |= 1 << 24
+    buffer = ctypes.create_unicode_buffer(64)
+    length = int(user32.GetKeyNameTextW(lparam, buffer, len(buffer)))
+    if length <= 0:
+        return None
+    label = buffer.value.strip()
+    if label.casefold() in {
+        token.casefold(),
+        token.replace("_", " ").casefold(),
+    }:
+        return None
+    if token == "OEM_3" and label in {"`", "~", "Backquote", "Backtick"}:
+        return "Backtick"
+    return label or None
 
 
 def normalize_tk_event(event) -> int:
@@ -522,7 +571,6 @@ class SettingsViewModel:
         *,
         confirm_warning: Callable[[tuple[str, ...]], bool] | None = None,
     ) -> AppSettings:
-        previous_display = self.hotkey_text
         if self._recording:
             self.cancel_recording()
         try:
@@ -577,7 +625,11 @@ class SettingsWindow:
         self.view = view_model or SettingsViewModel(
             coordinator,
             startup_enabled=startup_enabled,
-            key_label_resolver=key_label_resolver,
+            key_label_resolver=(
+                windows_key_label_resolver
+                if key_label_resolver is None
+                else key_label_resolver
+            ),
         )
         self._native_recording = self.view.coordinator.native_recording
         self.window = tk.Toplevel(root)

@@ -55,6 +55,11 @@ class FakeHook:
         self.fail_open_calls += 1
         self.locked = False
 
+    def recording_channel(self, session_id):
+        if self.result.recording_session_id == session_id:
+            return self.result.recording_channel
+        return None
+
 
 def test_controller_routes_all_lock_actions_to_same_engine():
     hook = FakeHook()
@@ -205,4 +210,5 @@ def test_controller_exposes_acknowledged_recording_session_and_channel():
     assert session.session_id == "session-7"
     assert session.held_keys == frozenset({0x41})
     assert session.channel is channel
+    assert controller.recording_channel(session.session_id) is channel
     assert hook.calls == [HookCall(CommandKind.ENTER_RECORDING, None, 1.0)]

@@ -286,7 +286,7 @@ def test_shifted_punctuation_uses_shift_token_and_safe_oem_trigger():
 
     assert shortcut.canonical == "LShift+OEM_PLUS"
     assert "+" not in shortcut.trigger_name
-    assert format_shortcut(shortcut) == "LShift + +"
+    assert format_shortcut(shortcut) == "LShift + OEM key plus"
 
 
 @pytest.mark.parametrize("raw", ["Ctrl", "Alt", "Shift", "Win"])

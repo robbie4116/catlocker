@@ -74,3 +74,33 @@ Use this checklist to record manual verification on Windows 11. Mark each item a
 - Physical Stream Deck available: pending
 - `ISCC.exe` available: pending
 - If either item is unavailable, record that the scenario could not be completed physically and why.
+
+## Expanded Shortcut Retest — 2026-09-05
+
+This section preserves the earlier results above and records the expanded-shortcut implementation separately.
+
+- Build commit: final pushed `main` commit (reported with the artifact below)
+- Fresh executable SHA-256: recorded with the final rebuild result
+- Keyboard model: pending physical-device access
+- Windows version: pending physical-device access
+- Active keyboard layouts: pending physical-device access
+- Automated result: complete Python suite passed; no physical keyboard or native Settings/tray interaction was performed in this task
+- Overall result: pending physical verification
+
+| Physical scenario | Result | Reproduction / evidence required |
+|---|---|---|
+| Each L/R modifier recorded alone | PENDING | Record → Save → restart → lock → unlock in both starting lock states; verify side label and one toggle on release |
+| `LCtrl+K` versus `RCtrl+K` | PENDING | Record and save each side; restart and verify only the saved side activates |
+| Legacy `Ctrl+K` | PENDING | Load an existing generic setting and verify left, right, and both Ctrl sides still activate before rerecording |
+| Modifier held while another key is used | PENDING | Hold a configured standalone modifier, press/release another key, then release the modifier; verify no toggle |
+| Backtick and remaining punctuation | PENDING | Record each OEM key, save/reload, and verify the persisted OEM token is unchanged; include shifted punctuation |
+| Second keyboard layout | PENDING | Repeat punctuation labels and save/reload on another layout; verify labels/fallbacks and identities are stable |
+| Supported Fn result / no Fn event | PENDING | Record a key that emits `VolumeUp` or another supported event; try a no-event Fn combination and verify waiting plus the hint |
+| Unknown key or ambiguous modifier | PENDING | Verify the explanation remains after release, Save stays disabled, and retry works only after the attempt is released |
+| AltGr layout | PENDING | Verify actual hook output; do not treat extra-Ctrl AltGr output as an isolated `RAlt` tap |
+| Alt and Windows standalone | PENDING | Record both and note native menu/Start effects; verify no stuck modifiers |
+| Emergency dual Ctrl then release | PENDING | While locked, press exact Left Ctrl + Right Ctrl and release both; verify unlock and no relock |
+| Focus loss, close, cancel/reopen | PENDING | Verify accepted shortcut restoration, candidate retention on ordinary focus loss, and stale-session rejection after reopen |
+| Key held across lock/unlock | PENDING | Hold keys through lock/unlock and test another application for unmatched releases or stuck modifiers |
+
+No hardware result is inferred from the automated tests; every row above remains pending until exercised on the target Windows keyboard and layouts.

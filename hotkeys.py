@@ -144,17 +144,17 @@ VK_TO_NAME = {vk: name for name, vk in VK_NAMES.items()}
 SUPPORTED_MODIFIER_VKS = frozenset().union(*MODIFIER_VKS.values())
 ALL_MODIFIER_VKS = SUPPORTED_MODIFIER_VKS | frozenset(GENERIC_MODIFIER_VKS)
 OEM_DISPLAY_NAMES = {
-    "OEM_1": ";",
-    "OEM_PLUS": "+",
-    "OEM_COMMA": ",",
-    "OEM_MINUS": "-",
-    "OEM_PERIOD": ".",
-    "OEM_2": "/",
-    "OEM_3": "Backtick",
-    "OEM_4": "[",
-    "OEM_5": "\\",
-    "OEM_6": "]",
-    "OEM_7": "'",
+    "OEM_1": "OEM key 1",
+    "OEM_PLUS": "OEM key plus",
+    "OEM_COMMA": "OEM key comma",
+    "OEM_MINUS": "OEM key minus",
+    "OEM_PERIOD": "OEM key period",
+    "OEM_2": "OEM key 2",
+    "OEM_3": "OEM key 3",
+    "OEM_4": "OEM key 4",
+    "OEM_5": "OEM key 5",
+    "OEM_6": "OEM key 6",
+    "OEM_7": "OEM key 7",
     "OEM_102": "OEM key 102",
 }
 

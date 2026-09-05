@@ -3,7 +3,6 @@ from __future__ import annotations
 from hotkeys import (
     GENERIC_MODIFIER_VKS,
     KeyEvent,
-    MODIFIER_VKS,
     Modifier,
     VK_CONTROL,
     VK_LCONTROL,
@@ -21,7 +20,15 @@ from hotkeys import (
 LLKHF_EXTENDED = 0x01
 LLKHF_LOWER_IL = 0x02
 LLKHF_INJECTED = 0x10
-_KNOWN_SIDE_FLAGS = LLKHF_EXTENDED | LLKHF_INJECTED
+LLKHF_ALTDOWN = 0x20
+LLKHF_UP = 0x80
+_KNOWN_METADATA_FLAGS = (
+    LLKHF_EXTENDED
+    | LLKHF_LOWER_IL
+    | LLKHF_INJECTED
+    | LLKHF_ALTDOWN
+    | LLKHF_UP
+)
 
 
 def _unresolved(raw_vk: int, family: Modifier, **kwargs) -> KeyEvent:
@@ -75,7 +82,9 @@ def normalize_key_event(
             **common,
         )
 
-    if flags & ~_KNOWN_SIDE_FLAGS:
+    if flags & ~_KNOWN_METADATA_FLAGS:
+        return _unresolved(raw_vk, family, **common)
+    if is_keydown and flags & LLKHF_UP:
         return _unresolved(raw_vk, family, **common)
 
     extended = bool(flags & LLKHF_EXTENDED)
@@ -105,8 +114,11 @@ NormalizedKeyEvent = KeyEvent
 
 
 __all__ = [
+    "LLKHF_ALTDOWN",
     "LLKHF_EXTENDED",
     "LLKHF_INJECTED",
+    "LLKHF_LOWER_IL",
+    "LLKHF_UP",
     "NormalizedKeyEvent",
     "normalize_key_event",
 ]

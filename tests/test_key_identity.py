@@ -11,7 +11,13 @@ from hotkeys import (
     VK_RSHIFT,
     VK_SHIFT,
 )
-from key_identity import LLKHF_EXTENDED, normalize_key_event
+from key_identity import (
+    LLKHF_ALTDOWN,
+    LLKHF_EXTENDED,
+    LLKHF_LOWER_IL,
+    LLKHF_UP,
+    normalize_key_event,
+)
 
 
 @pytest.mark.parametrize(
@@ -47,10 +53,11 @@ def test_explicit_modifier_virtual_keys_win_over_native_metadata(
     [
         (VK_CONTROL, 0x1D, 0, VK_LCONTROL),
         (VK_CONTROL, 0x1D, LLKHF_EXTENDED, VK_RCONTROL),
-        (0x12, 0x38, 0, VK_LMENU),
+        (0x12, 0x38, LLKHF_ALTDOWN, VK_LMENU),
         (0x12, 0x38, LLKHF_EXTENDED, VK_RMENU),
         (VK_SHIFT, 0x2A, 0, VK_LSHIFT),
-        (VK_SHIFT, 0x36, LLKHF_EXTENDED, VK_RSHIFT),
+        (VK_SHIFT, 0x36, LLKHF_EXTENDED | LLKHF_UP, VK_RSHIFT),
+        (VK_CONTROL, 0x1D, LLKHF_LOWER_IL | LLKHF_UP, VK_LCONTROL),
     ],
 )
 def test_generic_modifier_events_resolve_from_valid_scan_metadata(
@@ -72,10 +79,11 @@ def test_generic_modifier_events_resolve_from_valid_scan_metadata(
     ("raw_vk", "scan_code", "flags", "family"),
     [
         (VK_CONTROL, 0, 0, Modifier.CTRL),
-        (VK_CONTROL, 0x1D, LLKHF_EXTENDED | 0x02, Modifier.CTRL),
-        (0x12, 0x38, 0x02, Modifier.ALT),
+        (VK_CONTROL, 0x1D, LLKHF_EXTENDED | 0x04, Modifier.CTRL),
+        (0x12, 0x38, 0x04, Modifier.ALT),
         (VK_SHIFT, 0x2A, LLKHF_EXTENDED, Modifier.SHIFT),
         (VK_SHIFT, 0x00, 0, Modifier.SHIFT),
+        (VK_CONTROL, 0x1D, LLKHF_UP, Modifier.CTRL),
     ],
 )
 def test_invalid_or_inconsistent_modifier_metadata_stays_unresolved(
