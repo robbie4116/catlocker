@@ -1225,6 +1225,32 @@ def test_window_records_both_rows_and_cancel_restores_saved_values(monkeypatch):
     assert window._shortcut_rows["unlock"][0].get() == "F22"
 
 
+def test_window_mode_switch_record_and_save_reflects_in_row_widgets(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    assert window.view.action == "toggle"
+    assert window.view.separate_shortcuts is False
+
+    window.separate_var.set(True)
+    window._mode_changed()
+    assert window.view.separate_shortcuts is True
+    assert window.view.action == "lock"
+
+    window._record_action("lock")
+    window._on_key_press(FakeTkEvent(0x86, keysym="F23"))
+    window._record_action("unlock")
+    window._on_key_press(FakeTkEvent(0x85, keysym="F22"))
+
+    window._save()
+
+    assert window.view.coordinator.current.separate_shortcuts is True
+    assert window.view.coordinator.current.lock_hotkey == "F23"
+    assert window.view.coordinator.current.unlock_hotkey == "F22"
+    assert window._shortcut_rows["lock"][0].get() == "F23"
+    assert window._shortcut_rows["unlock"][0].get() == "F22"
+    assert window.hotkey_var is window._shortcut_rows["unlock"][0]
+    assert window.hotkey_var.get() == "F22"
+
+
 def test_window_labels_and_checkbox_text_match_spec(monkeypatch):
     window = make_settings_window(monkeypatch)
 

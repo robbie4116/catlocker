@@ -825,11 +825,19 @@ class SettingsWindow:
             self._row_frames["unlock"].pack_forget()
             self._row_frames["toggle"].pack(fill="x")
 
+    def _refresh_active_row(self) -> None:
+        """Point the hotkey_var/hotkey_entry/record_button aliases at the row for
+        the view's current action, then push its display text. Must reassign
+        before setting: _sync_controls()'s own loop only refreshes the *inactive*
+        rows, so setting text through a stale alias would write into the wrong
+        row."""
+        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
+        self.hotkey_var.set(self.view.hotkey_text)
+
     def show(self) -> None:
         if self.view.locked:
             return
-        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
-        self.hotkey_var.set(self.view.hotkey_text)
+        self._refresh_active_row()
         self.notifications_var.set(self.view.notifications)
         self.startup_var.set(self.view.startup_enabled)
         self.separate_var.set(self.view.separate_shortcuts)
@@ -873,15 +881,13 @@ class SettingsWindow:
             )
             self._sync_controls()
             return
-        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
-        self.hotkey_var.set(self.view.hotkey_text)
+        self._refresh_active_row()
         self._sync_controls()
 
     def _record_action(self, action):
         self._cleanup_recording_state()
         self.view.select_action(action)
-        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[action]
-        self.hotkey_var.set(self.view.hotkey_text)
+        self._refresh_active_row()
         self._record()
 
     def _record(self) -> None:
@@ -1005,8 +1011,7 @@ class SettingsWindow:
         finally:
             self._unbind_recording_events()
             self._cancel_recording_poll()
-            self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
-            self.hotkey_var.set(self.view.hotkey_text)
+            self._refresh_active_row()
             self._sync_controls()
             self.window.withdraw()
         if isinstance(error, EngineUnhealthy):
@@ -1115,6 +1120,12 @@ class SettingsWindow:
             button.configure(text=label, state="normal" if self.view.record_enabled else "disabled")
             if not is_active:
                 variable.set(self.view._display_shortcut(parse_shortcut(self.view._drafts[action])))
+        # Only the active-row alias needs to be resynced here — unlike show()/
+        # _mode_changed()/_record_action()/_close(), _sync_controls() must NOT push
+        # view.hotkey_text onto the active row's display: several call sites (e.g. a
+        # rejected recording attempt) intentionally call _sync_controls() while the
+        # active row is showing text that hasn't changed. Do not swap this for
+        # _refresh_active_row(), which would also call .set(...) and clobber that text.
         self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
         self.save_button.configure(
             state="normal" if self.view.save_enabled else "disabled",
