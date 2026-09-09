@@ -1,14 +1,14 @@
 # Tester feedback: shortcut modes and single instance
 
 Date: 2026-09-09
-Status: Agreed direction; detailed specification prepared for user review.
+Status: Approved by the user; implementation is reserved for a separate session.
 Implementation belongs in a separate session. This document makes no application changes.
 
 ## Intent and decisions
 
 Address Alfie's September 6 feedback: make separate lock/unlock bindings optional and prevent multiple running copies. Preserve Robbie's Stream Deck workflow.
 
-Confirmed: new users start in single-shortcut mode. Existing configurations retain their behavior. The remaining details below are proposed implementation defaults consistent with that direction.
+Confirmed: new users start in single-shortcut mode. Existing configurations retain their behavior. The user approved the detailed behavior below.
 
 These are two independently implementable changes. Prepare separate implementation plans after this specification is reviewed.
 
