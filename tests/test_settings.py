@@ -259,6 +259,37 @@ def test_explicit_mode_overrides_pair_inference():
     assert settings.separate_shortcuts is True
 
 
+def test_explicit_none_toggle_hotkey_is_treated_as_not_supplied():
+    # An explicit toggle_hotkey=None must behave exactly like omitting toggle_hotkey
+    # entirely (the _UNSET default), not like a real "None" binding value.
+    explicit_none = AppSettings(toggle_hotkey=None, lock_hotkey="F23")
+    omitted = AppSettings(lock_hotkey="F23")
+    assert explicit_none == omitted
+
+    assert explicit_none.unlock_hotkey is not None
+    assert explicit_none.toggle_hotkey is not None
+    assert explicit_none.lock_hotkey == "F23"
+    assert explicit_none.unlock_hotkey == "F24"
+    assert explicit_none.toggle_hotkey == "F23"
+    assert explicit_none.separate_shortcuts is True
+
+    # .active_shortcuts() must resolve cleanly rather than raising a bare AttributeError
+    # from parse_shortcut(None).
+    assert explicit_none.active_shortcuts() == ShortcutPair(
+        parse_shortcut("F23"), parse_shortcut("F24")
+    )
+
+
+def test_explicit_none_toggle_hotkey_with_no_pair_falls_back_to_default():
+    settings = AppSettings(toggle_hotkey=None)
+    assert settings == AppSettings()
+    assert settings.toggle_hotkey == "F24"
+    assert settings.lock_hotkey == "F24"
+    assert settings.unlock_hotkey == "F24"
+    assert settings.separate_shortcuts is False
+    assert settings.active_shortcuts() == ShortcutPair(parse_shortcut("F24"), parse_shortcut("F24"))
+
+
 def test_corrupt_toml_is_preserved_before_defaults_are_written(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text("not = [valid", encoding="utf-8")

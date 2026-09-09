@@ -46,7 +46,7 @@ class AppSettings:
         An explicitly supplied ``separate_shortcuts`` always wins over inference.
         """
         pair_supplied = lock_hotkey is not None or unlock_hotkey is not None
-        toggle_supplied = toggle_hotkey is not _UNSET
+        toggle_supplied = toggle_hotkey is not _UNSET and toggle_hotkey is not None
 
         if pair_supplied:
             fallback = toggle_hotkey if toggle_supplied else "F24"
