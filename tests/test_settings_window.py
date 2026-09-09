@@ -828,8 +828,14 @@ class FakeTkWidget:
         self._next_binding = 1
         self.focus_set_calls = 0
         self.textvariable = kwargs.get("textvariable")
+        self.packed = False
 
     def pack(self, *args, **kwargs):
+        self.packed = True
+        return None
+
+    def pack_forget(self):
+        self.packed = False
         return None
 
     def place(self, *args, **kwargs):
@@ -1052,7 +1058,9 @@ def test_view_updates_live_preview():
 
 
 def test_view_records_and_saves_both_actions():
-    coordinator = make_coordinator([])
+    # Separate mode so the initial action is "lock" (matching this test's intent of
+    # exercising the lock/unlock recorder pair specifically, not the single toggle row).
+    coordinator = make_coordinator([], current=AppSettings(separate_shortcuts=True))
     view = SettingsViewModel(coordinator)
     assert view.begin_recording()
     view.on_key_press(FakeTkEvent(0x86, keysym="F23"))
@@ -1064,6 +1072,141 @@ def test_view_records_and_saves_both_actions():
     assert saved.unlock_hotkey == "F24"
     view.select_action("lock")
     assert view.hotkey_text == "F23"
+
+
+def test_view_initial_mode_and_action_reflect_stored_settings():
+    single_view = SettingsViewModel(make_coordinator([], current=AppSettings()))
+    assert single_view.separate_shortcuts is False
+    assert single_view.action == "toggle"
+    assert single_view.hotkey_text == "F24"
+
+    separate_view = SettingsViewModel(
+        make_coordinator([], current=AppSettings(separate_shortcuts=True))
+    )
+    assert separate_view.separate_shortcuts is True
+    assert separate_view.action == "lock"
+
+
+def test_view_remembers_three_independent_drafts():
+    coordinator = make_coordinator(
+        [],
+        current=AppSettings("K", True, lock_hotkey="L", unlock_hotkey="M", separate_shortcuts=True),
+    )
+    view = SettingsViewModel(coordinator)
+
+    assert view._drafts == {"toggle": "K", "lock": "L", "unlock": "M"}
+
+
+def test_view_mode_switch_preserves_unsaved_recorder_edits():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x86, keysym="F23"))
+
+    assert view.set_separate_shortcuts(True) is True
+
+    assert view._drafts["toggle"] == "F23"
+    assert view.action == "lock"
+    assert view.hotkey_text == "F24"
+
+    view.select_action("unlock")
+    view.select_action("lock")
+    assert view.hotkey_text == "F24"
+
+    assert view.set_separate_shortcuts(False) is True
+    assert view.action == "toggle"
+    assert view.hotkey_text == "F23"
+
+
+def test_view_completed_recording_immediately_followed_by_mode_switch_lands_in_old_action():
+    """The plan's named race: finishing a recording and then immediately flipping the
+    mode checkbox must capture the just-completed candidate into the PREVIOUS action's
+    draft slot, never into the newly selected action's slot."""
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x86, keysym="F23"))
+    assert view.recording is False
+
+    accepted = view.set_separate_shortcuts(True)
+
+    assert accepted is True
+    assert view._drafts["toggle"] == "F23"
+    assert view._drafts["lock"] == "F24"
+    assert view.action == "lock"
+    assert view.hotkey_text == "F24"
+
+
+def test_view_mode_switch_rejected_during_active_recording_does_not_cancel_it():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+    assert view.begin_recording()
+
+    accepted = view.set_separate_shortcuts(True)
+
+    assert accepted is False
+    assert view.recording is True
+    assert view.separate_shortcuts is False
+    assert view.action == "toggle"
+
+
+def test_view_mode_switch_rejected_while_locked():
+    coordinator = make_coordinator([], locked=True)
+    view = SettingsViewModel(coordinator)
+
+    accepted = view.set_separate_shortcuts(True)
+
+    assert accepted is False
+    assert view.separate_shortcuts is False
+
+
+def test_view_save_persists_mode_and_all_three_drafts():
+    coordinator = make_coordinator([], current=AppSettings())
+    view = SettingsViewModel(coordinator)
+    assert view.set_separate_shortcuts(True) is True
+    view.select_action("lock")
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x86, keysym="F23"))
+    view.select_action("unlock")
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x85, keysym="F22"))
+
+    saved = view.save()
+
+    assert saved.separate_shortcuts is True
+    assert saved.lock_hotkey == "F23"
+    assert saved.unlock_hotkey == "F22"
+    assert saved.toggle_hotkey == "F24"
+    assert view.separate_shortcuts is True
+    assert view._drafts == {"toggle": "F24", "lock": "F23", "unlock": "F22"}
+
+
+def test_view_close_discards_mode_and_draft_changes():
+    coordinator = make_coordinator([], current=AppSettings())
+    view = SettingsViewModel(coordinator)
+    assert view.set_separate_shortcuts(True) is True
+    view.select_action("lock")
+    assert view.begin_recording()
+    view.on_key_press(FakeTkEvent(0x86, keysym="F23"))
+
+    view.on_close()
+
+    assert view.separate_shortcuts is False
+    assert view.action == "toggle"
+    assert view._drafts == {"toggle": "F24", "lock": "F24", "unlock": "F24"}
+    assert view.hotkey_text == "F24"
+
+
+def test_view_lock_transition_does_not_discard_unsaved_mode_draft():
+    coordinator = make_coordinator([])
+    view = SettingsViewModel(coordinator)
+    assert view.set_separate_shortcuts(True) is True
+    assert view.begin_recording()
+
+    view.on_lock_state(True)
+
+    assert view.recording is False
+    assert view.separate_shortcuts is True
 
 
 def test_window_records_both_rows_and_cancel_restores_saved_values(monkeypatch):
@@ -1080,6 +1223,108 @@ def test_window_records_both_rows_and_cancel_restores_saved_values(monkeypatch):
     window._close()
     assert window._shortcut_rows["lock"][0].get() == "F23"
     assert window._shortcut_rows["unlock"][0].get() == "F22"
+
+
+def test_window_labels_and_checkbox_text_match_spec(monkeypatch):
+    window = make_settings_window(monkeypatch)
+
+    assert window.separate_checkbox.configured["text"] == "Use separate lock and unlock shortcuts"
+    assert window._row_labels["toggle"].configured["text"] == "Lock / unlock shortcut:"
+    assert window._row_labels["lock"].configured["text"] == "Lock shortcut:"
+    assert window._row_labels["unlock"].configured["text"] == "Unlock shortcut:"
+
+
+def test_window_single_mode_shows_only_toggle_row(monkeypatch):
+    window = make_settings_window(monkeypatch)
+
+    assert window._row_frames["toggle"].packed is True
+    assert window._row_frames["lock"].packed is False
+    assert window._row_frames["unlock"].packed is False
+
+
+def test_window_separate_mode_shows_lock_and_unlock_rows(monkeypatch):
+    coordinator = make_coordinator([], current=AppSettings(separate_shortcuts=True))
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+
+    assert window._row_frames["toggle"].packed is False
+    assert window._row_frames["lock"].packed is True
+    assert window._row_frames["unlock"].packed is True
+
+
+def test_window_shortcut_rows_are_read_only(monkeypatch):
+    coordinator = make_coordinator([], current=AppSettings(separate_shortcuts=True))
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+
+    for _var, entry, _button in window._shortcut_rows.values():
+        assert entry.configured["state"] == "readonly"
+
+
+def test_window_checkbox_switches_visible_rows_and_default_action(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    assert window.view.action == "toggle"
+
+    window.separate_var.set(True)
+    window._mode_changed()
+
+    assert window.view.separate_shortcuts is True
+    assert window.view.action == "lock"
+    assert window._row_frames["toggle"].packed is False
+    assert window._row_frames["lock"].packed is True
+    assert window._row_frames["unlock"].packed is True
+    assert window.hotkey_var is window._shortcut_rows["lock"][0]
+
+    window.separate_var.set(False)
+    window._mode_changed()
+
+    assert window.view.separate_shortcuts is False
+    assert window.view.action == "toggle"
+    assert window._row_frames["toggle"].packed is True
+    assert window._row_frames["lock"].packed is False
+    assert window._row_frames["unlock"].packed is False
+    assert window.hotkey_var is window._shortcut_rows["toggle"][0]
+
+
+def test_window_checkbox_rejected_while_recording_reverts_and_keeps_recording(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    window._record()
+    assert window.view.recording is True
+
+    window.separate_var.set(True)
+    window._mode_changed()
+
+    assert window.view.recording is True
+    assert window.view.separate_shortcuts is False
+    assert window.separate_var.get() is False
+    assert window._row_frames["toggle"].packed is True
+    assert window._row_frames["lock"].packed is False
+    assert window.status_var.get() != ""
+
+
+def test_window_checkbox_rejected_while_locked(monkeypatch):
+    coordinator = make_coordinator([], locked=True)
+    window = make_settings_window(monkeypatch, coordinator=coordinator)
+
+    window.separate_var.set(True)
+    window._mode_changed()
+
+    assert window.view.separate_shortcuts is False
+    assert window.separate_var.get() is False
+
+
+def test_window_checkbox_disabled_during_recording_and_when_locked(monkeypatch):
+    window = make_settings_window(monkeypatch)
+    assert window.separate_checkbox.configured["state"] == "normal"
+
+    window._record()
+    assert window.separate_checkbox.configured["state"] == "disabled"
+
+    window._cleanup_recording_state()
+    assert window.separate_checkbox.configured["state"] == "normal"
+
+    locked_window = make_settings_window(
+        monkeypatch, coordinator=make_coordinator([], locked=True)
+    )
+    assert locked_window.separate_checkbox.configured["state"] == "disabled"
 
 
 def test_pair_is_rolled_back_when_persistence_fails():

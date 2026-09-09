@@ -472,9 +472,14 @@ class SettingsViewModel:
     ) -> None:
         self.coordinator = coordinator
         self._key_label_resolver = key_label_resolver
-        self.action = "lock"
-        self._drafts = {"lock": coordinator.current.lock_hotkey, "unlock": coordinator.current.unlock_hotkey}
-        self._accepted_canonical = coordinator.current.lock_hotkey
+        self.separate_shortcuts = bool(coordinator.current.separate_shortcuts)
+        self.action = "lock" if self.separate_shortcuts else "toggle"
+        self._drafts = {
+            "toggle": coordinator.current.toggle_hotkey,
+            "lock": coordinator.current.lock_hotkey,
+            "unlock": coordinator.current.unlock_hotkey,
+        }
+        self._accepted_canonical = self._drafts[self.action]
         self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
         self.notifications = coordinator.current.notifications
         self.startup_enabled = bool(startup_enabled)
@@ -488,13 +493,31 @@ class SettingsViewModel:
             self.coordinator.discard_candidate()
 
     def select_action(self, action):
-        if action not in ("lock", "unlock"):
+        if action not in ("toggle", "lock", "unlock"):
             raise ValueError(action)
         self.cancel_recording()
         self._capture_draft()
         self.action = action
         self._accepted_canonical = self._drafts[action]
         self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
+
+    def set_separate_shortcuts(self, enabled: bool) -> bool:
+        """Switch between single-toggle and separate lock/unlock recorder modes.
+
+        Rejected outright (returns False) while a recording is in progress or while
+        Cat Mode is locked, WITHOUT cancelling any live recording. A completed-but-
+        uncaptured candidate for the current action is captured into that action's own
+        draft slot before the mode/action switch happens, so it can never land in the
+        newly selected action's slot.
+        """
+        if self._recording or self.locked:
+            return False
+        self._capture_draft()
+        self.separate_shortcuts = bool(enabled)
+        self.action = "lock" if self.separate_shortcuts else "toggle"
+        self._accepted_canonical = self._drafts[self.action]
+        self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
+        return True
 
     def _display_shortcut(self, shortcut: Shortcut) -> str:
         return format_shortcut(
@@ -608,9 +631,14 @@ class SettingsViewModel:
             self.cancel_recording()
             self.coordinator.discard_candidate()
         finally:
-            self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             self.notifications = self.coordinator.current.notifications
-            self._drafts = {"lock": self.coordinator.current.lock_hotkey, "unlock": self.coordinator.current.unlock_hotkey}
+            self.separate_shortcuts = bool(self.coordinator.current.separate_shortcuts)
+            self._drafts = {
+                "toggle": self.coordinator.current.toggle_hotkey,
+                "lock": self.coordinator.current.lock_hotkey,
+                "unlock": self.coordinator.current.unlock_hotkey,
+            }
+            self.action = "lock" if self.separate_shortcuts else "toggle"
             self._accepted_canonical = self._drafts[self.action]
             self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
 
@@ -628,14 +656,21 @@ class SettingsViewModel:
                 self.notifications,
                 confirm_warning=confirm_warning,
                 unlock_hotkey=self._drafts["unlock"],
+                separate_shortcuts=self.separate_shortcuts,
+                toggle_hotkey=self._drafts["toggle"],
             )
         except Exception:
             self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
             raise
-        self._drafts = {"lock": saved.lock_hotkey, "unlock": saved.unlock_hotkey}
+        self._drafts = {
+            "toggle": saved.toggle_hotkey,
+            "lock": saved.lock_hotkey,
+            "unlock": saved.unlock_hotkey,
+        }
         self._accepted_canonical = self._drafts[self.action]
         self.hotkey_text = self._display_shortcut(parse_shortcut(self._accepted_canonical))
         self.notifications = saved.notifications
+        self.separate_shortcuts = bool(saved.separate_shortcuts)
         return saved
 
     def set_startup_enabled(self, enabled: bool) -> StartupUpdateResult:
@@ -688,29 +723,54 @@ class SettingsWindow:
         self.window.withdraw()
         self.window.protocol("WM_DELETE_WINDOW", self._close)
 
-        self.hotkey_var = tk.StringVar(self.window, value=self.view.hotkey_text)
         self.notifications_var = tk.BooleanVar(self.window, value=self.view.notifications)
         self.startup_var = tk.BooleanVar(self.window, value=self.view.startup_enabled)
         self.status_var = tk.StringVar(self.window, value="")
+        self.separate_var = tk.BooleanVar(self.window, value=self.view.separate_shortcuts)
 
         frame = tk.Frame(self.window, padx=12, pady=12)
         frame.pack(fill="both", expand=True)
-        tk.Label(frame, text="Lock keyboard:").pack(anchor="w")
-        self.hotkey_entry = tk.Entry(frame, textvariable=self.hotkey_var)
-        self.hotkey_entry.pack(fill="x", pady=(0, 8))
-        self.record_button = tk.Button(frame, text="Record lock shortcut", command=lambda: self._record_action("lock"))
-        self.record_button.pack(anchor="w")
-        tk.Label(frame, text="Unlock keyboard:").pack(anchor="w", pady=(12, 0))
-        self.unlock_var = tk.StringVar(self.window, value=self.view._display_shortcut(parse_shortcut(coordinator.current.unlock_hotkey)))
-        self.unlock_entry = tk.Entry(frame, textvariable=self.unlock_var)
-        self.unlock_entry.pack(fill="x", pady=(0, 8))
-        self.unlock_button = tk.Button(frame, text="Record unlock shortcut", command=lambda: self._record_action("unlock"))
-        self.unlock_button.pack(anchor="w")
-        tk.Label(frame, text="Use the same shortcut for both to toggle.").pack(anchor="w", pady=(8, 0))
-        self._shortcut_rows = {
-            "lock": (self.hotkey_var, self.hotkey_entry, self.record_button),
-            "unlock": (self.unlock_var, self.unlock_entry, self.unlock_button),
+
+        self.separate_checkbox = tk.Checkbutton(
+            frame,
+            text="Use separate lock and unlock shortcuts",
+            variable=self.separate_var,
+            command=self._mode_changed,
+        )
+        self.separate_checkbox.pack(anchor="w")
+
+        self._record_button_labels = {
+            "toggle": "Record lock / unlock shortcut",
+            "lock": "Record lock shortcut",
+            "unlock": "Record unlock shortcut",
         }
+        self._rows_container = tk.Frame(frame)
+        self._rows_container.pack(fill="x")
+        toggle_frame, toggle_label, toggle_var, toggle_entry, toggle_button = self._build_shortcut_row(
+            self._rows_container, "Lock / unlock shortcut:", "toggle"
+        )
+        lock_frame, lock_label, lock_var, lock_entry, lock_button = self._build_shortcut_row(
+            self._rows_container, "Lock shortcut:", "lock"
+        )
+        unlock_frame, unlock_label, unlock_var, unlock_entry, unlock_button = self._build_shortcut_row(
+            self._rows_container, "Unlock shortcut:", "unlock"
+        )
+        self._shortcut_rows = {
+            "toggle": (toggle_var, toggle_entry, toggle_button),
+            "lock": (lock_var, lock_entry, lock_button),
+            "unlock": (unlock_var, unlock_entry, unlock_button),
+        }
+        self._row_frames = {
+            "toggle": toggle_frame,
+            "lock": lock_frame,
+            "unlock": unlock_frame,
+        }
+        self._row_labels = {
+            "toggle": toggle_label,
+            "lock": lock_label,
+            "unlock": unlock_label,
+        }
+        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
 
         tk.Checkbutton(
             frame,
@@ -736,12 +796,44 @@ class SettingsWindow:
         self._recording_poll_id = None
         self._sync_controls()
 
+    def _build_shortcut_row(self, parent, label_text: str, action: str):
+        """Build one label + read-only entry + record-button row, wrapped in its own
+        frame so hiding the row (pack_forget on the frame) leaves no layout gap."""
+        tk = self._tk
+        row_frame = tk.Frame(parent)
+        label = tk.Label(row_frame, text=label_text)
+        label.pack(anchor="w")
+        initial_value = self.view._display_shortcut(parse_shortcut(self.view._drafts[action]))
+        var = tk.StringVar(self.window, value=initial_value)
+        entry = tk.Entry(row_frame, textvariable=var)
+        entry.pack(fill="x", pady=(0, 8))
+        button = tk.Button(
+            row_frame,
+            text=self._record_button_labels[action],
+            command=lambda: self._record_action(action),
+        )
+        button.pack(anchor="w")
+        return row_frame, label, var, entry, button
+
+    def _apply_row_visibility(self) -> None:
+        if self.view.separate_shortcuts:
+            self._row_frames["toggle"].pack_forget()
+            self._row_frames["lock"].pack(fill="x")
+            self._row_frames["unlock"].pack(fill="x", pady=(12, 0))
+        else:
+            self._row_frames["lock"].pack_forget()
+            self._row_frames["unlock"].pack_forget()
+            self._row_frames["toggle"].pack(fill="x")
+
     def show(self) -> None:
         if self.view.locked:
             return
+        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
         self.hotkey_var.set(self.view.hotkey_text)
         self.notifications_var.set(self.view.notifications)
         self.startup_var.set(self.view.startup_enabled)
+        self.separate_var.set(self.view.separate_shortcuts)
+        self._sync_controls()
         self.window.deiconify()
         self.window.lift()
         self.hotkey_entry.focus_set()
@@ -769,6 +861,21 @@ class SettingsWindow:
     def on_startup_state(self, enabled: bool) -> None:
         self.view.startup_enabled = bool(enabled)
         self.startup_var.set(self.view.startup_enabled)
+
+    def _mode_changed(self) -> None:
+        requested = bool(self.separate_var.get())
+        if not self.view.set_separate_shortcuts(requested):
+            self.separate_var.set(self.view.separate_shortcuts)
+            self.status_var.set(
+                "Finish or cancel the current recording before changing shortcut mode."
+                if self.view.recording
+                else "Settings are unavailable while Cat Mode is locked."
+            )
+            self._sync_controls()
+            return
+        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
+        self.hotkey_var.set(self.view.hotkey_text)
+        self._sync_controls()
 
     def _record_action(self, action):
         self._cleanup_recording_state()
@@ -898,6 +1005,7 @@ class SettingsWindow:
         finally:
             self._unbind_recording_events()
             self._cancel_recording_poll()
+            self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
             self.hotkey_var.set(self.view.hotkey_text)
             self._sync_controls()
             self.window.withdraw()
@@ -999,20 +1107,21 @@ class SettingsWindow:
         self._show_error(error)
 
     def _sync_controls(self) -> None:
+        self._apply_row_visibility()
         for action, (variable, entry, button) in getattr(self, "_shortcut_rows", {}).items():
             entry.configure(state="disabled" if self.view.locked else "readonly")
-            button.configure(text=f"Record {action} shortcut", state="normal" if self.view.record_enabled else "disabled")
-            if action != self.view.action:
+            is_active = action == self.view.action
+            label = "Press a shortcut..." if (is_active and self.view.recording) else self._record_button_labels[action]
+            button.configure(text=label, state="normal" if self.view.record_enabled else "disabled")
+            if not is_active:
                 variable.set(self.view._display_shortcut(parse_shortcut(self.view._drafts[action])))
-        self.record_button.configure(
-            text="Press a shortcut..." if self.view.recording else f"Record {self.view.action} shortcut",
-            state="normal" if self.view.record_enabled else "disabled",
-        )
+        self.hotkey_var, self.hotkey_entry, self.record_button = self._shortcut_rows[self.view.action]
         self.save_button.configure(
             state="normal" if self.view.save_enabled else "disabled",
         )
-        self.hotkey_entry.configure(
-            state="disabled" if self.view.locked else "readonly",
+        self.separate_var.set(self.view.separate_shortcuts)
+        self.separate_checkbox.configure(
+            state="normal" if self.view.record_enabled else "disabled",
         )
 
     def _show_error(self, error: BaseException) -> None:
