@@ -401,21 +401,35 @@ class AppLifecycle:
         Rechecks lock state fresh (never a value captured back when the
         signal was first observed) and never invokes `controller.lock()`,
         `.unlock()`, or `.toggle()` in either branch.
+
+        Both branches call into Tk (`settings_window.show()` or
+        `messagebox.showinfo()` via `_show_locked_message`), which -- like
+        the activation poll above in `pump_events` -- can raise for reasons
+        that have nothing to do with the keyboard engine (a `TclError` from
+        a misbehaving root, a theme issue, etc). Such a failure is reported
+        and swallowed here rather than left to propagate: an uncaught
+        exception from a duplicate-launch dialog would escape `pump_events`
+        before it reaches `self._schedule_pump()`, permanently freezing the
+        25ms pump loop (tray updates, tray actions, and future activation
+        requests) even though the keyboard hook itself would keep running.
         """
-        if bool(getattr(self.controller, "locked", False)):
-            if self._activation_dialog_open:
-                # Tk's `messagebox.showinfo` blocks via a nested event loop
-                # in which the 25ms pump can still fire; coalesce a repeated
-                # activation while one status dialog is already visible
-                # rather than stacking another.
+        try:
+            if bool(getattr(self.controller, "locked", False)):
+                if self._activation_dialog_open:
+                    # Tk's `messagebox.showinfo` blocks via a nested event
+                    # loop in which the 25ms pump can still fire; coalesce a
+                    # repeated activation while one status dialog is already
+                    # visible rather than stacking another.
+                    return
+                self._activation_dialog_open = True
+                try:
+                    self._show_locked_message(_ACTIVATION_LOCKED_MESSAGE)
+                finally:
+                    self._activation_dialog_open = False
                 return
-            self._activation_dialog_open = True
-            try:
-                self._show_locked_message(_ACTIVATION_LOCKED_MESSAGE)
-            finally:
-                self._activation_dialog_open = False
-            return
-        self.settings_window.show()
+            self.settings_window.show()
+        except BaseException as error:
+            self._report_error(error)
 
     def _show_locked_message(self, text: str) -> None:
         from tkinter import messagebox

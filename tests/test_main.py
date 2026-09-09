@@ -1131,6 +1131,54 @@ def test_activation_poll_failure_reported_once_and_disables_further_polling():
     assert len(poll_calls) == 1
 
 
+def test_activation_handling_failure_reported_and_pump_not_frozen():
+    """`_handle_activation()` calls into Tk (`settings_window.show()` here,
+    `messagebox.showinfo()` via `_show_locked_message` for the locked
+    branch), which can raise for reasons unrelated to the keyboard engine --
+    a `TclError` from a misbehaving root, a theme issue, etc.
+
+    Such a failure must be reported like the activation poll failure above,
+    not left to propagate out of `pump_events()`: an escaping exception
+    would skip the trailing `self._schedule_pump()` call, and since nothing
+    else ever re-arms `root.after()` for the next tick, the entire 25ms pump
+    loop would freeze permanently -- tray updates, all tray-menu actions,
+    and all future activation requests stop, even though the keyboard hook
+    itself (on its own thread) would keep working.
+    """
+
+    app, calls = make_app(activation_source=lambda: True)
+    app.start()
+    calls.clear()
+    app.root.after_calls.clear()
+
+    def failing_show():
+        raise RuntimeError("settings window failed to show")
+
+    app.settings_window.show = failing_show
+
+    # Drive one real pump tick the way `root.after()` would actually invoke
+    # it: `_run_scheduled_pump` clears the "pump scheduled" flag *before*
+    # calling `pump_events()`, so if `pump_events()` fails to reach its
+    # trailing `_schedule_pump()` call, the flag is left False and no future
+    # tick is ever armed again.
+    app._run_scheduled_pump()  # must not raise -- see assertion (a) below
+
+    # (a) The exception did not propagate out of pump_events(): the call
+    # above already returned normally instead of raising, which is itself
+    # the primary regression check.
+
+    # (b) The exception was reported exactly once via `_report_error`.
+    assert calls.count(("root_show_error", "settings window failed to show")) == 1
+
+    # (c) The pump loop is still armed for the next tick -- proof the loop
+    # did not freeze.
+    assert app._pump_scheduled is True
+    assert len(app.root.after_calls) == 1
+
+    # The activation dialog bookkeeping must not be left stuck either.
+    assert app._activation_dialog_open is False
+
+
 def test_shutdown_clears_activation_source():
     app, _ = make_app(activation_source=lambda: True)
     app.start()
