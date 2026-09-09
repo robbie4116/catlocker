@@ -34,6 +34,21 @@ def _finite_timeout(value: float, operation: str) -> float:
     return timeout
 
 
+_ACTIVATION_LOCKED_MESSAGE = "CatLocker is already running; the keyboard is locked."
+
+
+@dataclass(frozen=True)
+class ActivateExisting:
+    """Internal action enqueued onto `actions` when a duplicate launch signals
+    for activation of the existing owner's UI.
+
+    Carries no data by design -- the activation channel only ever means "show
+    the existing app," never a lock command, configuration, or arbitrary
+    payload. Distinct from `tray.TrayAction`'s enum values so
+    `handle_tray_action` can route it separately from ordinary tray actions.
+    """
+
+
 @dataclass
 class ApplicationFactories:
     """Optional construction seams for the application composition root."""
@@ -80,6 +95,7 @@ class AppLifecycle:
         shutdown_timeout: float | None = None,
         pump_interval_ms: int = PUMP_INTERVAL_MS,
         startup_registry: object | None = None,
+        activation_source: Callable[[], bool] | None = None,
     ) -> None:
         self.root = root
         self.hook = hook
@@ -102,6 +118,8 @@ class AppLifecycle:
         )
         self.pump_interval_ms = int(pump_interval_ms)
         self.startup_registry = startup_registry
+        self._activation_source = activation_source
+        self._activation_dialog_open = False
         self._main_thread_id = threading.get_ident()
         self._running = False
         self._closing = False
@@ -162,6 +180,10 @@ class AppLifecycle:
         self._closing = True
         self._running = False
         self._pump_scheduled = False
+        # Defense-in-depth: even a not-yet-cancelled `root.after()` callback
+        # (Tk's `after_cancel()` isn't guaranteed instantaneous) must never
+        # poll into a guard/adapter that may already be torn down.
+        self._activation_source = None
 
         try:
             self.controller.unlock(
@@ -241,6 +263,10 @@ class AppLifecycle:
         if self._closing:
             return
 
+        if isinstance(action, ActivateExisting):
+            self._handle_activation()
+            return
+
         try:
             from tray import TrayAction
 
@@ -303,6 +329,22 @@ class AppLifecycle:
                 self._handle_fatal(error)
                 return
 
+        if self._activation_source is not None:
+            try:
+                signaled = self._activation_source()
+            except BaseException as error:
+                # A genuine poll failure (per InstanceGuard.poll_activation's
+                # documented "raise for wait failure" contract): report it
+                # once and stop polling for the rest of this run. The guard
+                # itself, the keyboard hook, and normal lock/unlock stay
+                # untouched -- this only disables further activation
+                # responsiveness.
+                self._activation_source = None
+                self._report_error(error)
+            else:
+                if signaled:
+                    self.actions.put(ActivateExisting())
+
         while True:
             try:
                 action = self.actions.get_nowait()
@@ -353,6 +395,33 @@ class AppLifecycle:
 
         self.tray.post_update(TrayUpdate(startup_enabled=bool(enabled)))
 
+    def _handle_activation(self) -> None:
+        """Present the existing UI in response to a duplicate-launch signal.
+
+        Rechecks lock state fresh (never a value captured back when the
+        signal was first observed) and never invokes `controller.lock()`,
+        `.unlock()`, or `.toggle()` in either branch.
+        """
+        if bool(getattr(self.controller, "locked", False)):
+            if self._activation_dialog_open:
+                # Tk's `messagebox.showinfo` blocks via a nested event loop
+                # in which the 25ms pump can still fire; coalesce a repeated
+                # activation while one status dialog is already visible
+                # rather than stacking another.
+                return
+            self._activation_dialog_open = True
+            try:
+                self._show_locked_message(_ACTIVATION_LOCKED_MESSAGE)
+            finally:
+                self._activation_dialog_open = False
+            return
+        self.settings_window.show()
+
+    def _show_locked_message(self, text: str) -> None:
+        from tkinter import messagebox
+
+        messagebox.showinfo("CatLocker", text, parent=self.root)
+
     def _enter_fail_open(self) -> None:
         enter_fail_open = getattr(self.controller, "enter_fail_open", None)
         if callable(enter_fail_open):
@@ -393,6 +462,7 @@ def create_application(
     factories: ApplicationFactories | object | None = None,
     command_timeout: float = DEFAULT_COMMAND_TIMEOUT,
     thread_timeout: float = DEFAULT_THREAD_TIMEOUT,
+    activation_source: Callable[[], bool] | None = None,
 ) -> AppLifecycle:
     """Compose the real application without starting any worker thread."""
 
@@ -556,6 +626,7 @@ def create_application(
             command_timeout=command_timeout,
             thread_timeout=thread_timeout,
             startup_registry=startup_registry,
+            activation_source=activation_source,
         )
         lifecycle_ref["app"] = lifecycle
         return lifecycle
@@ -594,7 +665,7 @@ def main(
     argv: list[str] | None = None,
     *,
     guard_factory: Callable[[], object] = InstanceGuard,
-    application_factory: Callable[[], AppLifecycle] = create_application,
+    application_factory: Callable[..., AppLifecycle] = create_application,
     message_box: Callable[[str, str], object] = _show_startup_message,
 ) -> int:
     """Guarded composition-root entry point.
@@ -637,7 +708,7 @@ def main(
             guard.close()
 
     try:
-        application_factory().run()
+        application_factory(activation_source=guard.poll_activation).run()
     finally:
         guard.close()
     return 0

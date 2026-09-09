@@ -327,6 +327,7 @@ def make_app(
     hook=None,
     tray=None,
     shutdown_timeout=None,
+    activation_source=None,
 ):
     calls = []
     root = FakeRoot(calls)
@@ -348,6 +349,8 @@ def make_app(
     lifecycle_options = {}
     if shutdown_timeout is not None:
         lifecycle_options["shutdown_timeout"] = shutdown_timeout
+    if activation_source is not None:
+        lifecycle_options["activation_source"] = activation_source
     app = AppLifecycle(
         root=root,
         hook=hook,
@@ -889,6 +892,252 @@ def test_lifecycle_shuts_down_when_tray_runtime_fails():
     assert ("root_show_error", "tray runtime failed") in calls
 
 
+# --- Activation (single-instance, Task 4) -----------------------------------
+#
+# `AppLifecycle` can be given an `activation_source` -- a zero-arg callable
+# (in production, `InstanceGuard.poll_activation`) polled once per pump
+# iteration. A signal enqueues a typed `ActivateExisting` action onto the
+# same `actions` queue tray actions already flow through, so it is handled
+# on the Tk main thread through the ordinary action-draining loop.
+
+_ACTIVATION_LOCKED_MESSAGE = "CatLocker is already running; the keyboard is locked."
+
+
+def test_signaled_activation_queues_activate_existing_and_dispatches_on_main_thread():
+    from main import ActivateExisting
+
+    app, calls = make_app(activation_source=lambda: True)
+    app.start()
+    seen = []
+    original = app.handle_tray_action
+
+    def spy(action):
+        seen.append((action, threading.get_ident()))
+        original(action)
+
+    app.handle_tray_action = spy
+
+    app.pump_events()
+
+    assert len(seen) == 1
+    action, thread_id = seen[0]
+    assert isinstance(action, ActivateExisting)
+    assert thread_id == threading.get_ident()
+    assert ("settings_show", threading.get_ident()) in calls
+
+
+def test_activation_not_polled_or_queued_when_no_source_configured():
+    app, calls = make_app()
+    app.start()
+    app.pump_events()
+    assert not any(call[0] == "settings_show" for call in calls)
+
+
+def test_activation_not_queued_when_poll_returns_false():
+    app, calls = make_app(activation_source=lambda: False)
+    app.start()
+    app.pump_events()
+    assert not any(call[0] == "settings_show" for call in calls)
+
+
+def test_handle_tray_action_rejects_activation_off_main_thread():
+    from main import ActivateExisting
+
+    app, calls = make_app()
+    app.start()
+    errors = []
+
+    def call_off_thread():
+        try:
+            app.handle_tray_action(ActivateExisting())
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=call_off_thread)
+    thread.start()
+    thread.join(timeout=1)
+
+    assert len(errors) == 1
+    assert "main thread" in str(errors[0]).lower()
+    assert not any(call[0] == "settings_show" for call in calls)
+
+
+def test_activation_rechecks_lock_state_at_handling_time_not_signaling_time():
+    """The lock state must be read fresh inside `_handle_activation`, not
+    captured back when the signal was first observed. Flip the controller to
+    locked from inside the activation source itself -- unlocked "at signal
+    time", locked by the time the queued action is actually handled."""
+
+    app, calls = make_app()
+    app.start()
+
+    def activation_source():
+        app.controller.locked = True
+        return True
+
+    app._activation_source = activation_source
+    app._show_locked_message = lambda text: calls.append(("locked_message", text))
+
+    app.pump_events()
+
+    assert not any(call[0] == "settings_show" for call in calls)
+    assert ("locked_message", _ACTIVATION_LOCKED_MESSAGE) in calls
+
+
+def test_unlocked_activation_shows_existing_settings_window():
+    app, calls = make_app()
+    app.start()
+    app._handle_activation()
+    assert ("settings_show", threading.get_ident()) in calls
+
+
+def test_locked_activation_shows_message_and_never_touches_settings():
+    app, calls = make_app()
+    app.start()
+    app.controller.locked = True
+    calls.clear()
+    shown = []
+    app._show_locked_message = lambda text: shown.append(text)
+
+    app._handle_activation()
+
+    assert shown == [_ACTIVATION_LOCKED_MESSAGE]
+    assert not any(call[0] == "settings_show" for call in calls)
+
+
+@pytest.mark.parametrize("locked", [False, True])
+def test_activation_never_invokes_lock_unlock_or_toggle(locked):
+    app, calls = make_app()
+    app.start()
+    app.controller.locked = locked
+    app._show_locked_message = lambda text: None
+    calls.clear()
+
+    app._handle_activation()
+
+    assert not any(
+        call[0] in ("controller_lock", "controller_unlock", "controller_toggle")
+        for call in calls
+    )
+
+
+def test_repeated_activation_while_dialog_open_is_coalesced():
+    app, calls = make_app()
+    app.start()
+    app.controller.locked = True
+    dialog_calls = []
+
+    def fake_show_locked_message(text):
+        dialog_calls.append(text)
+        # Simulate Tk's nested modal event loop still pumping `after()`
+        # callbacks while `messagebox.showinfo` is blocking -- a second
+        # activation signal arriving mid-dialog must not open another one.
+        app._handle_activation()
+
+    app._show_locked_message = fake_show_locked_message
+
+    app._handle_activation()
+
+    assert dialog_calls == [_ACTIVATION_LOCKED_MESSAGE]
+    assert app._activation_dialog_open is False
+
+
+def test_show_locked_message_default_calls_tkinter_messagebox_showinfo(monkeypatch):
+    from types import ModuleType
+
+    recorded = []
+    fake_tk = ModuleType("tkinter")
+    fake_messagebox = ModuleType("tkinter.messagebox")
+
+    def fake_showinfo(title, message, parent=None):
+        recorded.append((title, message, parent))
+
+    fake_messagebox.showinfo = fake_showinfo
+    fake_tk.messagebox = fake_messagebox
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    monkeypatch.setitem(sys.modules, "tkinter.messagebox", fake_messagebox)
+
+    app, _ = make_app()
+    app._show_locked_message(_ACTIVATION_LOCKED_MESSAGE)
+
+    assert recorded == [("CatLocker", _ACTIVATION_LOCKED_MESSAGE, app.root)]
+
+
+def test_locked_activation_message_independent_of_notifications_preference():
+    app, calls = make_app()
+    app.start()
+    app.controller.locked = True
+    # Even a coordinator reporting notifications disabled must not suppress
+    # or alter the locked-activation dialog: it is never gated on the
+    # tray/settings notification preference.
+    app.coordinator.current = SimpleNamespace(notifications=False)
+    shown = []
+    app._show_locked_message = lambda text: shown.append(text)
+
+    app._handle_activation()
+
+    assert shown == [_ACTIVATION_LOCKED_MESSAGE]
+
+
+def test_pump_events_ignores_activation_while_closing():
+    activation_calls = []
+
+    def activation_source():
+        activation_calls.append(1)
+        return True
+
+    app, calls = make_app(activation_source=activation_source)
+    app.start()
+    app.shutdown()
+    calls.clear()
+
+    app.pump_events()
+
+    assert activation_calls == []
+    assert not any(call[0] == "settings_show" for call in calls)
+
+
+def test_activation_poll_failure_reported_once_and_disables_further_polling():
+    from single_instance import InstanceError
+
+    poll_calls = []
+
+    def failing_poll():
+        poll_calls.append(1)
+        raise InstanceError("WaitForSingleObject failed while polling.")
+
+    app, calls = make_app(activation_source=failing_poll)
+    app.start()
+    calls.clear()
+
+    app.pump_events()
+
+    assert len(poll_calls) == 1
+    assert any(
+        call == ("root_show_error", "WaitForSingleObject failed while polling.")
+        for call in calls
+    )
+    assert app._activation_source is None
+    assert app.running is True
+    assert app.closing is False
+    assert not any(
+        call[0] in ("hook_stop", "tray_stop", "controller_fail_open")
+        for call in calls
+    )
+
+    # Polling must never be attempted again for the rest of this run, and the
+    # app must keep pumping normally (hook/tray/keyboard recovery untouched).
+    app.pump_events()
+    assert len(poll_calls) == 1
+
+
+def test_shutdown_clears_activation_source():
+    app, _ = make_app(activation_source=lambda: True)
+    app.start()
+    app.shutdown()
+    assert app._activation_source is None
+
+
 # --- Guarded entry point (single-instance) ---------------------------------
 #
 # `main()` wraps the composition root (`create_application()`) with a
@@ -922,6 +1171,10 @@ class FakeGuard:
     def request_activation(self, timeout=2.0):
         self.calls.append(("request_activation", timeout))
         return self.activation_result
+
+    def poll_activation(self):
+        self.calls.append("poll_activation")
+        return False
 
     def close(self):
         self.calls.append("close")
@@ -960,7 +1213,7 @@ def test_main_owner_path_acquires_ownership_before_building_and_running_app():
 
     fake_app = SimpleNamespace(run=lambda: events.append("run"))
 
-    def application_factory():
+    def application_factory(activation_source=None):
         events.append("application_factory")
         return fake_app
 
@@ -973,6 +1226,28 @@ def test_main_owner_path_acquires_ownership_before_building_and_running_app():
 
     assert exit_code == 0
     assert events == ["acquire", "application_factory", "run", "close"]
+
+
+def test_main_owner_path_passes_guard_poll_activation_as_activation_source():
+    """The owner's activation source must be the guard's own bound
+    `poll_activation` method, threaded through `application_factory` -- not
+    reimplemented, wrapped, or omitted."""
+
+    guard = FakeGuard(role=InstanceRole.OWNER)
+    received = {}
+
+    def application_factory(*, activation_source=None):
+        received["activation_source"] = activation_source
+        return SimpleNamespace(run=lambda: None)
+
+    main(
+        [],
+        guard_factory=lambda: guard,
+        application_factory=application_factory,
+        message_box=RecordingMessageBox(),
+    )
+
+    assert received["activation_source"] == guard.poll_activation
 
 
 @pytest.mark.parametrize("startup_flag", [[], ["--startup"]])
@@ -1044,7 +1319,7 @@ def test_main_owner_construction_failure_still_closes_guard_and_propagates():
     guard = FakeGuard(role=InstanceRole.OWNER)
     error = RuntimeError("failed to build application")
 
-    def application_factory():
+    def application_factory(activation_source=None):
         raise error
 
     with pytest.raises(RuntimeError, match="failed to build application"):
@@ -1065,7 +1340,7 @@ def test_main_owner_run_failure_still_closes_guard_and_propagates():
     def failing_run():
         raise error
 
-    application_factory = lambda: SimpleNamespace(run=failing_run)
+    application_factory = lambda activation_source=None: SimpleNamespace(run=failing_run)
 
     with pytest.raises(RuntimeError, match="run failed"):
         main(

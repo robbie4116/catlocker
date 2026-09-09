@@ -1530,6 +1530,56 @@ def test_settings_window_is_reusable_after_cancel_and_titlebar_close(monkeypatch
     assert window.window.deiconify_count == 3
 
 
+def test_show_preserves_in_progress_recording_when_reopened(monkeypatch):
+    """Task 4: `AppLifecycle._handle_activation()` calls `show()` to raise the
+    existing Toplevel when a duplicate launch signals for activation while
+    unlocked. A mid-recording session must survive that -- only actual focus
+    loss (covered elsewhere) may cancel a live recording, never `show()`
+    itself."""
+    window = make_settings_window(monkeypatch)
+    window.show()
+    window._record()
+    window._on_key_press(FakeTkEvent(0xFF, keysym="Control_L"))
+
+    assert window.view.recording is True
+    assert window.hotkey_var.get() == "LCtrl"
+    bindings_before = list(window._recording_bindings)
+
+    window.show()
+
+    assert window.view.recording is True
+    assert window.hotkey_var.get() == "LCtrl"
+    assert window._recording_bindings == bindings_before
+
+
+def test_show_preserves_captured_unsaved_candidate_when_reopened(monkeypatch):
+    """A shortcut already captured but not yet Saved must still be showing
+    when `show()` is called again (e.g. via activation) -- not reloaded back
+    to the persisted value."""
+    window = make_settings_window(monkeypatch)
+    window.show()
+    window._record()
+    dispatch_child_event(
+        window.hotkey_entry, window.window, "<KeyPress>", FakeTkEvent(0xFF, keysym="Control_L")
+    )
+    dispatch_child_event(
+        FakeTkWidget(), window.window, "<KeyPress>", FakeTkEvent(0xFF, keysym="Shift_L")
+    )
+    dispatch_child_event(
+        FakeTkWidget(), window.window, "<KeyRelease>", FakeTkEvent(0xFE, keysym="Shift_L")
+    )
+    dispatch_child_event(
+        window.hotkey_entry, window.window, "<KeyPress>", FakeTkEvent(0x4B, keysym="k")
+    )
+
+    assert window.view.recording is False
+    assert window.hotkey_var.get() == "LCtrl + K"
+
+    window.show()
+
+    assert window.hotkey_var.get() == "LCtrl + K"
+
+
 @pytest.mark.parametrize(
     "handler",
     [
