@@ -19,7 +19,6 @@ from hotkeys import (
     VK_RSHIFT,
     VK_RWIN,
     format_pressed_vks,
-    ShortcutPair,
     format_shortcut,
     parse_shortcut,
     shortcut_from_pressed_vks,
@@ -204,6 +203,8 @@ class SettingsCoordinator:
         *,
         confirm_warning: Callable[[tuple[str, ...]], bool] | None = None,
         unlock_hotkey: str | None = None,
+        separate_shortcuts: bool | None = None,
+        toggle_hotkey: str | None = None,
     ) -> AppSettings:
         if self.controller.locked:
             raise SettingsLocked("Settings are unavailable while Cat Mode is locked.")
@@ -217,21 +218,28 @@ class SettingsCoordinator:
             shortcut = validate_shortcut(parse_shortcut(lock_hotkey)).shortcut
         validation = validate_shortcut(shortcut)
         unlock_validation = validate_shortcut(parse_shortcut(unlock_hotkey)) if unlock_hotkey is not None else validation
-        warnings = tuple(dict.fromkeys(validation.warnings + unlock_validation.warnings))
+        # The toggle binding is validated too even when it is not the active pair right
+        # now: Saving validates all stored bindings, not just the ones currently in use.
+        toggle_validation = validate_shortcut(parse_shortcut(toggle_hotkey)) if toggle_hotkey is not None else None
+
+        warning_groups = [validation.warnings, unlock_validation.warnings]
+        if toggle_validation is not None:
+            warning_groups.append(toggle_validation.warnings)
+        warnings = tuple(dict.fromkeys(warning for group in warning_groups for warning in group))
         if warnings:
             if confirm_warning is None or not confirm_warning(warnings):
                 raise WarningDeclined("Shortcut warning was not confirmed.")
 
         candidate = AppSettings(
+            toggle_hotkey=(toggle_validation.shortcut.canonical if toggle_validation is not None else None),
+            notifications=bool(notifications),
             lock_hotkey=validation.shortcut.canonical,
             unlock_hotkey=unlock_validation.shortcut.canonical,
-            notifications=bool(notifications),
+            separate_shortcuts=separate_shortcuts,
         )
         previous = self._current
         try:
-            accepted = self.controller.replace_shortcut(
-                ShortcutPair(validation.shortcut, unlock_validation.shortcut)
-            )
+            accepted = self.controller.replace_shortcut(candidate.active_shortcuts())
         except EngineUnhealthy:
             self._clear_candidate()
             raise
@@ -242,10 +250,7 @@ class SettingsCoordinator:
             self._persist(candidate)
         except Exception:
             try:
-                rollback = self.controller.replace_shortcut(
-                    ShortcutPair(parse_shortcut(previous.lock_hotkey),
-                                 parse_shortcut(previous.unlock_hotkey))
-                )
+                rollback = self.controller.replace_shortcut(previous.active_shortcuts())
             except EngineUnhealthy:
                 self._clear_candidate()
                 raise

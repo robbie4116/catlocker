@@ -32,6 +32,7 @@ class FakeController:
         *,
         locked: bool = False,
         replace_result=1,
+        replace_error: BaseException | None = None,
         rollback_error: BaseException | None = None,
         rollback_result=_UNSET,
         enter_recording_result: bool = True,
@@ -42,6 +43,7 @@ class FakeController:
         self.calls = calls
         self.locked = locked
         self.replace_result = replace_result
+        self.replace_error = replace_error
         self.rollback_error = rollback_error
         self.rollback_result = rollback_result
         self.enter_recording_result = enter_recording_result
@@ -50,10 +52,14 @@ class FakeController:
         self.exit_recording_error = exit_recording_error
         self.replace_count = 0
         self.fail_open_calls = 0
+        self.last_shortcut = None
 
     def replace_shortcut(self, shortcut):
         self.replace_count += 1
+        self.last_shortcut = shortcut
         self.calls.append(("replace", shortcut.canonical))
+        if self.replace_count == 1 and self.replace_error is not None:
+            raise self.replace_error
         if self.replace_count > 1 and self.rollback_error is not None:
             raise self.rollback_error
         if self.replace_count > 1 and self.rollback_result is not _UNSET:
@@ -249,6 +255,281 @@ def test_save_while_recording_exits_before_replacement():
     calls.clear()
     coordinator.save("K", True, confirm_warning=lambda messages: True)
     assert calls[:2] == [("exit_recording", None), ("replace", "K")]
+
+
+def test_legacy_save_call_with_differing_lock_and_unlock_infers_separate_mode():
+    """Task 4 has not migrated SettingsViewModel yet: it still calls save() without
+    mode/toggle. That omission must keep inferring mode from the pair exactly like
+    AppSettings' own pair-only construction, and install the resulting active pair."""
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    saved = coordinator.save(
+        "K",
+        True,
+        confirm_warning=lambda messages: True,
+        unlock_hotkey="L",
+    )
+
+    assert saved.separate_shortcuts is True
+    assert saved.active_shortcuts().lock.canonical == "K"
+    assert saved.active_shortcuts().unlock.canonical == "L"
+    assert calls == [
+        ("replace", "K"),
+        ("persist", saved),
+        ("notifications", True),
+    ]
+    assert coordinator.controller.last_shortcut.unlock.canonical == "L"
+
+
+def test_save_installs_toggle_pair_in_single_mode_despite_differing_stored_lock_unlock():
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    saved = coordinator.save(
+        "L",
+        True,
+        confirm_warning=lambda messages: True,
+        unlock_hotkey="M",
+        separate_shortcuts=False,
+        toggle_hotkey="K",
+    )
+
+    assert saved.separate_shortcuts is False
+    assert saved.toggle_hotkey == "K"
+    assert saved.lock_hotkey == "L"
+    assert saved.unlock_hotkey == "M"
+    # The installed pair must be toggle/toggle, not the differing stored lock/unlock.
+    assert calls == [
+        ("replace", "K"),
+        ("persist", saved),
+        ("notifications", True),
+    ]
+    assert coordinator.controller.last_shortcut.lock.canonical == "K"
+    assert coordinator.controller.last_shortcut.unlock.canonical == "K"
+
+
+def test_save_installs_lock_unlock_pair_in_separate_mode():
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    saved = coordinator.save(
+        "L",
+        True,
+        confirm_warning=lambda messages: True,
+        unlock_hotkey="M",
+        separate_shortcuts=True,
+        toggle_hotkey="K",
+    )
+
+    assert saved.separate_shortcuts is True
+    assert calls == [
+        ("replace", "L"),
+        ("persist", saved),
+        ("notifications", True),
+    ]
+    assert coordinator.controller.last_shortcut.lock.canonical == "L"
+    assert coordinator.controller.last_shortcut.unlock.canonical == "M"
+
+
+def test_save_rejects_invalid_inactive_lock_field_in_single_mode():
+    """Even a currently-inactive stored binding must be validated: an invalid lock
+    binding must reject the whole save, not be silently dropped or defaulted."""
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    with pytest.raises(ShortcutError):
+        coordinator.save(
+            "not a real shortcut!!",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="M",
+            separate_shortcuts=False,
+            toggle_hotkey="K",
+        )
+
+    assert calls == []
+    assert coordinator.current == AppSettings()
+
+
+def test_save_rejects_invalid_inactive_unlock_field_in_single_mode():
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    with pytest.raises(ShortcutError):
+        coordinator.save(
+            "L",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="not a real shortcut!!",
+            separate_shortcuts=False,
+            toggle_hotkey="K",
+        )
+
+    assert calls == []
+    assert coordinator.current == AppSettings()
+
+
+def test_save_rejects_invalid_inactive_toggle_field_in_separate_mode():
+    """The toggle binding is inactive while separate mode is selected, but the spec
+    requires validating all stored bindings, so an invalid toggle still rejects."""
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    with pytest.raises(ShortcutError):
+        coordinator.save(
+            "K",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="L",
+            separate_shortcuts=True,
+            toggle_hotkey="",
+        )
+
+    assert calls == []
+    assert coordinator.current == AppSettings()
+
+
+def test_save_dedupes_warnings_across_toggle_lock_and_unlock():
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+    seen_warnings = []
+
+    def confirm_warning(messages):
+        seen_warnings.append(messages)
+        return True
+
+    coordinator.save(
+        "Win+L",
+        True,
+        confirm_warning=confirm_warning,
+        unlock_hotkey="Win+R",
+        separate_shortcuts=True,
+        toggle_hotkey="Alt+Tab",
+    )
+
+    # All three bindings trigger the same "Windows system shortcut" warning text;
+    # it must be deduplicated into a single entry, not repeated per binding.
+    assert seen_warnings == [
+        ("This is a Windows system shortcut and may have surprising behavior.",)
+    ]
+
+
+def test_save_declines_warning_from_inactive_toggle_field():
+    """A warning on the currently-inactive toggle binding must still block save
+    when declined, proving inactive fields are validated *and* warned on."""
+    calls = []
+    coordinator = make_coordinator(calls, current=AppSettings())
+
+    with pytest.raises(WarningDeclined):
+        coordinator.save(
+            "K",
+            True,
+            confirm_warning=lambda messages: False,
+            unlock_hotkey="M",
+            separate_shortcuts=True,
+            toggle_hotkey="Win+L",
+        )
+
+    assert calls == []
+    assert coordinator.current == AppSettings()
+
+
+def test_save_persistence_failure_rolls_back_to_previous_active_pair_across_mode_change():
+    """Regression test for the rollback bug this task fixes: rollback must reinstall
+    whatever pair was actually ACTIVE before (toggle/toggle in single mode), not the
+    raw stored lock/unlock fields, even when those differ from the active toggle."""
+    calls = []
+    previous = AppSettings(
+        "K",
+        True,
+        lock_hotkey="L",
+        unlock_hotkey="M",
+        separate_shortcuts=False,
+    )
+    coordinator = make_coordinator(
+        calls,
+        current=previous,
+        persist_error=OSError("disk full"),
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        coordinator.save(
+            "N",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="O",
+            separate_shortcuts=True,
+            toggle_hotkey="P",
+        )
+
+    assert calls == [
+        ("replace", "N"),
+        ("persist", AppSettings("P", True, lock_hotkey="N", unlock_hotkey="O", separate_shortcuts=True)),
+        ("replace", "K"),
+    ]
+    assert coordinator.current == previous
+
+
+def test_save_rollback_rejection_enters_fail_open_with_explicit_mode():
+    coordinator = make_coordinator(
+        [],
+        current=AppSettings(),
+        persist_error=OSError("disk full"),
+        rollback_result=None,
+    )
+
+    with pytest.raises(EngineUnhealthy, match="rollback rejected"):
+        coordinator.save(
+            "K",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="L",
+            separate_shortcuts=True,
+            toggle_hotkey="M",
+        )
+
+    assert coordinator.controller.fail_open_calls == 1
+    assert coordinator.current == AppSettings()
+
+
+def test_save_propagates_engine_unhealthy_from_initial_replace_with_explicit_mode():
+    calls = []
+    coordinator = make_coordinator(
+        calls,
+        current=AppSettings(),
+        controller_options={"replace_error": EngineUnhealthy("stalled")},
+    )
+
+    with pytest.raises(EngineUnhealthy, match="stalled"):
+        coordinator.save(
+            "K",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="L",
+            separate_shortcuts=True,
+            toggle_hotkey="M",
+        )
+
+    assert not any(call[0] == "persist" for call in calls)
+    assert coordinator.current == AppSettings()
+
+
+def test_save_locked_state_rejects_before_validation_or_io_with_explicit_mode():
+    calls = []
+    coordinator = make_coordinator(calls, locked=True)
+
+    with pytest.raises(SettingsLocked):
+        coordinator.save(
+            "K",
+            True,
+            confirm_warning=lambda messages: True,
+            unlock_hotkey="L",
+            separate_shortcuts=True,
+            toggle_hotkey="M",
+        )
+
+    assert calls == []
 
 
 def test_startup_write_failure_refreshes_actual_state_and_returns_primary_error():

@@ -565,6 +565,56 @@ def test_create_application_wires_loaded_settings_and_actual_startup(tmp_path):
     assert factories.coordinator_settings == AppSettings("Ctrl+Alt+F12", False)
 
 
+def test_create_application_installs_toggle_pair_at_startup_despite_differing_stored_pair(
+    tmp_path,
+):
+    """Single mode must win at startup even when a stale, differing lock/unlock pair
+    is remembered from a previous separate-mode session."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'separate_shortcuts = false\n'
+        'toggle_hotkey = "Ctrl+Alt+F12"\n'
+        'lock_hotkey = "F13"\n'
+        'unlock_hotkey = "F14"\n'
+        'notifications = false\n',
+        encoding="utf-8",
+    )
+    factories = RecordingFactories(startup_enabled=True)
+    create_application(
+        config_path=config_path,
+        executable=tmp_path / "CatLocker.exe",
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.hook_shortcut.lock.canonical == "Ctrl+Alt+F12"
+    assert factories.hook_shortcut.unlock.canonical == "Ctrl+Alt+F12"
+
+
+def test_create_application_installs_lock_unlock_pair_at_startup_in_separate_mode(
+    tmp_path,
+):
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        'separate_shortcuts = true\n'
+        'toggle_hotkey = "F15"\n'
+        'lock_hotkey = "F13"\n'
+        'unlock_hotkey = "F14"\n'
+        'notifications = false\n',
+        encoding="utf-8",
+    )
+    factories = RecordingFactories(startup_enabled=True)
+    create_application(
+        config_path=config_path,
+        executable=tmp_path / "CatLocker.exe",
+        resource_root=tmp_path,
+        factories=factories,
+    )
+
+    assert factories.hook_shortcut.lock.canonical == "F13"
+    assert factories.hook_shortcut.unlock.canonical == "F14"
+
+
 def test_frozen_mode_builds_executable_only_startup_command(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     factories = RecordingFactories()
