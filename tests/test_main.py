@@ -27,9 +27,10 @@ import pytest
 
 from controller import EngineUnhealthy
 from keyboard_hook import EngineEvent, HookTimeout
-from main import AppLifecycle, create_application
+from main import AppLifecycle, create_application, main
 from settings import AppSettings
 from settings_window import StartupUpdateResult
+from single_instance import AcquireResult, InstanceError, InstanceRole
 from tray import TrayAction, TrayFatalEvent, TrayTimeout
 
 
@@ -886,3 +887,230 @@ def test_lifecycle_shuts_down_when_tray_runtime_fails():
     assert ("hook_stop",) in calls
     assert ("root_destroy",) in calls
     assert ("root_show_error", "tray runtime failed") in calls
+
+
+# --- Guarded entry point (single-instance) ---------------------------------
+#
+# `main()` wraps the composition root (`create_application()`) with a
+# single-instance guard (`single_instance.InstanceGuard`). These tests never
+# touch a real OS mutex/event or a real Win32 MessageBox -- they inject a
+# fake guard and a spy/fake application factory and message-box sink.
+
+
+class FakeGuard:
+    """Stand-in for `single_instance.InstanceGuard` used only by `main()`."""
+
+    def __init__(
+        self,
+        *,
+        role=InstanceRole.OWNER,
+        acquire_error=None,
+        activation_result=True,
+    ):
+        self.calls = []
+        self.role = role
+        self.acquire_error = acquire_error
+        self.activation_result = activation_result
+        self.closed = False
+
+    def acquire(self):
+        self.calls.append("acquire")
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        return AcquireResult(self.role)
+
+    def request_activation(self, timeout=2.0):
+        self.calls.append(("request_activation", timeout))
+        return self.activation_result
+
+    def close(self):
+        self.calls.append("close")
+        self.closed = True
+
+
+class RecordingMessageBox:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, title, text):
+        self.calls.append((title, text))
+
+
+def _never_call_application_factory():
+    raise AssertionError("application_factory must not be called for a duplicate instance")
+
+
+def test_main_owner_path_acquires_ownership_before_building_and_running_app():
+    """Ownership must be established before ANY application construction,
+    and both construction and run() must be wrapped so the guard is always
+    released, even on the successful path."""
+
+    events = []
+    guard = FakeGuard(role=InstanceRole.OWNER)
+
+    def spy_acquire():
+        events.append("acquire")
+        return AcquireResult(InstanceRole.OWNER)
+
+    def spy_close():
+        events.append("close")
+
+    guard.acquire = spy_acquire
+    guard.close = spy_close
+
+    fake_app = SimpleNamespace(run=lambda: events.append("run"))
+
+    def application_factory():
+        events.append("application_factory")
+        return fake_app
+
+    exit_code = main(
+        [],
+        guard_factory=lambda: guard,
+        application_factory=application_factory,
+        message_box=RecordingMessageBox(),
+    )
+
+    assert exit_code == 0
+    assert events == ["acquire", "application_factory", "run", "close"]
+
+
+@pytest.mark.parametrize("startup_flag", [[], ["--startup"]])
+def test_main_duplicate_path_never_calls_application_factory(startup_flag):
+    guard = FakeGuard(role=InstanceRole.DUPLICATE, activation_result=False)
+
+    main(
+        startup_flag,
+        guard_factory=lambda: guard,
+        application_factory=_never_call_application_factory,
+        message_box=RecordingMessageBox(),
+    )
+
+
+def test_main_normal_duplicate_launch_requests_activation_and_succeeds_quietly():
+    guard = FakeGuard(role=InstanceRole.DUPLICATE, activation_result=True)
+    message_box = RecordingMessageBox()
+
+    exit_code = main(
+        [],
+        guard_factory=lambda: guard,
+        application_factory=_never_call_application_factory,
+        message_box=message_box,
+    )
+
+    assert exit_code == 0
+    assert ("request_activation", 2.0) in guard.calls
+    assert message_box.calls == []
+    assert guard.closed is True
+
+
+def test_main_duplicate_launch_activation_failure_shows_tray_message():
+    guard = FakeGuard(role=InstanceRole.DUPLICATE, activation_result=False)
+    message_box = RecordingMessageBox()
+
+    exit_code = main(
+        [],
+        guard_factory=lambda: guard,
+        application_factory=_never_call_application_factory,
+        message_box=message_box,
+    )
+
+    assert exit_code != 0
+    assert ("request_activation", 2.0) in guard.calls
+    assert len(message_box.calls) == 1
+    title, text = message_box.calls[0]
+    assert "tray" in text.lower()
+    assert guard.closed is True
+
+
+def test_main_duplicate_startup_launch_exits_quietly_without_activation_or_dialog():
+    guard = FakeGuard(role=InstanceRole.DUPLICATE, activation_result=True)
+    message_box = RecordingMessageBox()
+
+    exit_code = main(
+        ["--startup"],
+        guard_factory=lambda: guard,
+        application_factory=_never_call_application_factory,
+        message_box=message_box,
+    )
+
+    assert exit_code == 0
+    assert not any(call[0] == "request_activation" for call in guard.calls)
+    assert message_box.calls == []
+    assert guard.closed is True
+
+
+def test_main_owner_construction_failure_still_closes_guard_and_propagates():
+    guard = FakeGuard(role=InstanceRole.OWNER)
+    error = RuntimeError("failed to build application")
+
+    def application_factory():
+        raise error
+
+    with pytest.raises(RuntimeError, match="failed to build application"):
+        main(
+            [],
+            guard_factory=lambda: guard,
+            application_factory=application_factory,
+            message_box=RecordingMessageBox(),
+        )
+
+    assert guard.closed is True
+
+
+def test_main_owner_run_failure_still_closes_guard_and_propagates():
+    guard = FakeGuard(role=InstanceRole.OWNER)
+    error = RuntimeError("run failed")
+
+    def failing_run():
+        raise error
+
+    application_factory = lambda: SimpleNamespace(run=failing_run)
+
+    with pytest.raises(RuntimeError, match="run failed"):
+        main(
+            [],
+            guard_factory=lambda: guard,
+            application_factory=application_factory,
+            message_box=RecordingMessageBox(),
+        )
+
+    assert guard.closed is True
+
+
+def test_main_ownership_error_reports_and_exits_without_constructing_app():
+    guard = FakeGuard(acquire_error=InstanceError("mutex creation failed"))
+    message_box = RecordingMessageBox()
+
+    exit_code = main(
+        [],
+        guard_factory=lambda: guard,
+        application_factory=_never_call_application_factory,
+        message_box=message_box,
+    )
+
+    assert exit_code != 0
+    assert len(message_box.calls) == 1
+    assert "mutex creation failed" in message_box.calls[0][1]
+    assert guard.closed is True
+
+
+def test_main_unexpected_acquire_failure_still_closes_guard_and_propagates():
+    """A non-InstanceError bug inside acquire() must not skip cleanup: only
+    InstanceError is treated as the documented "unexpected OS error" case
+    that gets reported via message_box, but any other exception should still
+    release the guard before propagating."""
+
+    guard = FakeGuard(acquire_error=RuntimeError("adapter bug"))
+    message_box = RecordingMessageBox()
+
+    with pytest.raises(RuntimeError, match="adapter bug"):
+        main(
+            [],
+            guard_factory=lambda: guard,
+            application_factory=_never_call_application_factory,
+            message_box=message_box,
+        )
+
+    assert guard.closed is True
+    assert message_box.calls == []

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 from controller import EngineUnhealthy
+from single_instance import InstanceError, InstanceGuard
 
 
 PUMP_INTERVAL_MS = 25
@@ -572,5 +573,75 @@ def _show_tk_error(root: object, error: BaseException) -> None:
     messagebox.showerror("CatLocker", str(error), parent=root)
 
 
+def _show_startup_message(title: str, text: str) -> None:
+    """Lazily show a native MessageBox with no Tk root involved.
+
+    Used only for the pre-application-construction messages `main()` needs
+    (an unexpected ownership error, or a duplicate launch that could not
+    activate the existing owner) -- at that point there is no Tk root to
+    parent a dialog to, and building one just to show an error would defeat
+    the point of guarding construction. Once the app is actually running,
+    `_show_tk_error` (parented to the real root) is used instead.
+    """
+
+    import ctypes
+
+    MB_OK = 0x00000000
+    ctypes.windll.user32.MessageBoxW(None, text, title, MB_OK)
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    guard_factory: Callable[[], object] = InstanceGuard,
+    application_factory: Callable[[], AppLifecycle] = create_application,
+    message_box: Callable[[str, str], object] = _show_startup_message,
+) -> int:
+    """Guarded composition-root entry point.
+
+    Establishes single-instance ownership *before* any root/config/hook/tray
+    construction. An owner builds and runs the real application, releasing
+    the guard when construction or `run()` finishes or raises. A duplicate
+    launch never calls `application_factory` at all: it requests activation
+    of the existing owner (unless this is a quiet `--startup` launch) and
+    reports the outcome without starting a second hook.
+    """
+
+    args = list(sys.argv[1:] if argv is None else argv)
+    is_startup_launch = "--startup" in args
+
+    guard = guard_factory()
+    try:
+        result = guard.acquire()
+    except InstanceError as error:
+        guard.close()
+        message_box("CatLocker", f"CatLocker could not start: {error}")
+        return 1
+    except BaseException:
+        guard.close()
+        raise
+
+    if result.is_duplicate:
+        try:
+            if is_startup_launch:
+                return 0
+            if guard.request_activation():
+                return 0
+            message_box(
+                "CatLocker",
+                "CatLocker is already running. Look for its icon in the "
+                "Windows system tray.",
+            )
+            return 1
+        finally:
+            guard.close()
+
+    try:
+        application_factory().run()
+    finally:
+        guard.close()
+    return 0
+
+
 if __name__ == "__main__":
-    create_application().run()
+    sys.exit(main())
