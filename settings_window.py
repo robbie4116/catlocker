@@ -139,6 +139,13 @@ class RecordingUpdate:
     recording: bool
 
 
+# Sentinel distinguishing "caller did not pass toggle_hotkey at all" from an explicit
+# ``None``, mirroring the ``_UNSET`` convention in settings.py. save()'s own default
+# (``None``) already carries meaning for lock/unlock-style fields, so toggle_hotkey needs
+# a value that no real caller could ever legitimately pass.
+_UNSET = object()
+
+
 class SettingsCoordinator:
     def __init__(
         self,
@@ -204,10 +211,18 @@ class SettingsCoordinator:
         confirm_warning: Callable[[tuple[str, ...]], bool] | None = None,
         unlock_hotkey: str | None = None,
         separate_shortcuts: bool | None = None,
-        toggle_hotkey: str | None = None,
+        toggle_hotkey: str | None = _UNSET,
     ) -> AppSettings:
         if self.controller.locked:
             raise SettingsLocked("Settings are unavailable while Cat Mode is locked.")
+
+        if toggle_hotkey is _UNSET:
+            # No fresh toggle draft was supplied. An explicit mode call (separate_shortcuts
+            # given) is the modern API and simply left the toggle field untouched, so the
+            # previously stored toggle binding must survive this save unchanged. A fully
+            # legacy call (mode also omitted) keeps delegating to AppSettings' own
+            # pair-only inference below, exactly as it did before this sentinel existed.
+            toggle_hotkey = self._current.toggle_hotkey if separate_shortcuts is not None else None
 
         if self._recording:
             self.end_recording()

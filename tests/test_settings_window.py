@@ -332,6 +332,29 @@ def test_save_installs_lock_unlock_pair_in_separate_mode():
     assert coordinator.controller.last_shortcut.unlock.canonical == "M"
 
 
+def test_save_preserves_stored_toggle_when_omitted_in_explicit_mode_call():
+    """Regression test: an explicit-mode save() call (separate_shortcuts supplied) that
+    leaves toggle_hotkey unsupplied must preserve the previously stored toggle binding,
+    not silently fall back to the newly saved lock value."""
+    calls = []
+    previous = AppSettings("K", True)
+    coordinator = make_coordinator(calls, current=previous)
+
+    saved = coordinator.save(
+        "L",
+        True,
+        confirm_warning=lambda messages: True,
+        unlock_hotkey="N",
+        separate_shortcuts=True,
+    )
+
+    assert saved.toggle_hotkey == previous.toggle_hotkey
+    assert saved.toggle_hotkey == "K"
+    assert saved.lock_hotkey == "L"
+    assert saved.unlock_hotkey == "N"
+    assert saved.separate_shortcuts is True
+
+
 def test_save_rejects_invalid_inactive_lock_field_in_single_mode():
     """Even a currently-inactive stored binding must be validated: an invalid lock
     binding must reject the whole save, not be silently dropped or defaulted."""
