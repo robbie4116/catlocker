@@ -2,7 +2,16 @@
 
 CatLocker is a Windows 11-only tray utility that locks keyboard input while leaving the mouse usable. It is designed to sit in the notification area, always starts unlocked, and recover from the mouse or an exact `Left Ctrl + Right Ctrl` chord.
 
-The default setup is `F24`, which makes CatLocker practical with a Stream Deck or any other device that can send `F24`. Settings provides separate **Lock keyboard** and **Unlock keyboard** shortcuts. Assign the same shortcut to both for toggle behavior, or different shortcuts for each action. Existing toggle shortcuts are loaded into both fields.
+The default setup for new installs is a single toggle shortcut, `F24`, which makes CatLocker practical with a Stream Deck or any other device that can send `F24`.
+
+Settings offers a **Use separate lock and unlock shortcuts** checkbox above the shortcut recorder:
+
+- Unchecked (single mode, the default): one **Lock / unlock shortcut** row is shown. The same shortcut both locks and unlocks — pressing it toggles Cat Mode.
+- Checked (separate mode): two rows are shown, **Lock shortcut** and **Unlock shortcut**, each with its own record button. Each shortcut only performs its own action; pressing Lock while already locked, or Unlock while already unlocked, does nothing.
+
+CatLocker remembers the toggle binding and both halves of the separate-mode pair independently, even for the mode that isn't currently active. Switching the checkbox, saving, and restarting the app all preserve whichever bindings you last recorded in each mode — recording a new toggle shortcut does not erase a previously recorded separate-mode pair, and vice versa. Clicking Cancel or closing the Settings window discards any unsaved checkbox or recording changes.
+
+Upgrading from a version that only had a single Lock keyboard shortcut and a single Unlock keyboard shortcut preserves that configuration unchanged: if the two were already different (for example, a Stream Deck bound to `F23` for lock and `F24` for unlock), CatLocker migrates to separate mode automatically and keeps both bindings as they were. If the two were the same, it migrates to single mode with that shared shortcut as the toggle. No existing shortcut is renamed, cleared, or silently changed by the upgrade.
 
 ## What it does
 

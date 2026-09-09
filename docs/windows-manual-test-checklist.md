@@ -104,3 +104,26 @@ This section preserves the earlier results above and records the expanded-shortc
 | Key held across lock/unlock | PENDING | Hold keys through lock/unlock and test another application for unmatched releases or stuck modifiers |
 
 No hardware result is inferred from the automated tests; every row above remains pending until exercised on the target Windows keyboard and layouts.
+
+## Shortcut Modes Retest — 2026-09-09
+
+This section preserves the earlier results above and records the shortcut-modes (single toggle vs. separate lock/unlock, with the **Use separate lock and unlock shortcuts** checkbox) implementation separately.
+
+- Build commit: final pushed `main` commit (reported with the artifact below)
+- Fresh executable SHA-256: recorded with the final rebuild result
+- Keyboard model: pending physical-device access
+- Windows version: pending physical-device access
+- Stream Deck present: pending
+- Automated result: complete Python suite passed, including the new `active_shortcuts()`-driven `InputState` tests in `tests/test_split_shortcuts.py`; no physical keyboard or native Settings/tray interaction was performed in this task
+- Overall result: pending physical verification
+
+| Physical scenario | Result | Reproduction / evidence required |
+|---|---|---|
+| Stream Deck `F23`/`F24` survive upgrade in separate mode | PENDING | On a machine already configured with distinct Stream Deck `F23` (lock) and `F24` (unlock) bindings, upgrade CatLocker; verify Settings opens with the checkbox already checked and both bindings shown unchanged, and that both physical buttons still perform their own action only |
+| Native recording in each visible row | PENDING | In single mode, record a new shortcut into the one **Lock / unlock shortcut** row and verify it saves and activates; check the checkbox to enter separate mode and record distinct shortcuts into the **Lock shortcut** and **Unlock shortcut** rows and verify both save and activate independently |
+| Generic vs. side-specific modifiers in both modes | PENDING | Record a generic `Ctrl+<key>` shortcut and verify either physical Ctrl key activates it; record a side-specific `LCtrl+<key>` or `RCtrl+<key>` shortcut and verify only that physical side activates it; repeat both in single mode (one row) and separate mode (both rows) |
+| Mode-switch persistence across restart | PENDING | Record distinct bindings in separate mode, save, restart the app, and confirm the checkbox is still checked and both bindings are intact; uncheck the checkbox, record a new toggle shortcut, save, restart, and confirm single mode and that toggle binding persisted; reopen Settings and re-check the checkbox to confirm the earlier separate-mode pair was still remembered |
+| Cancel discards unsaved changes | PENDING | Open Settings, toggle the checkbox and/or record a new shortcut in either mode, then click Cancel (or close the window without saving); verify the tray tooltip, active shortcut behavior, and `config.toml` on disk are all unchanged from before opening Settings |
+| Emergency unlock in both modes | PENDING | While locked in single mode, press the exact `Left Ctrl + Right Ctrl` chord and verify it unlocks; switch to separate mode with distinct lock/unlock bindings, lock again, and verify the same chord still unlocks |
+
+No hardware result is inferred from the automated tests; every row above remains pending until exercised on the target Windows keyboard and layouts.
