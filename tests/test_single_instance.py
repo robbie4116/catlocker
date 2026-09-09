@@ -9,7 +9,12 @@ for the same mutex/event names, the way real Windows processes would.
 
 from __future__ import annotations
 
+import queue
+import subprocess
 import sys
+import threading
+import uuid
+from pathlib import Path
 
 import pytest
 
@@ -508,3 +513,274 @@ def test_acquire_twice_on_same_guard_raises():
 def test_win32_adapter_can_be_constructed_without_touching_win32():
     adapter = Win32InstanceAdapter()
     assert adapter is not None
+
+
+# ---------------------------------------------------------------------------
+# Native subprocess tests (Windows-only, real Win32 mutex/event objects)
+# ---------------------------------------------------------------------------
+#
+# Everything above uses FakeInstanceAdapter and never touches ctypes/Win32.
+# The tests below launch real `python -c ...` subprocesses that each
+# construct a real `InstanceGuard` (default adapter -> a real
+# `Win32InstanceAdapter()`, never a fake) against a unique, per-test
+# `app_name` -- a fresh UUID suffix, e.g. "CatLockerNativeTest-<uuid4 hex>".
+# That produces mutex/event names (`Local\CatLockerNativeTest-<hex>.<SID>.*`)
+# completely disjoint from the real `Local\CatLocker.<SID>.*` names a
+# genuinely running CatLocker instance on this machine would use, and from
+# every other test's own random name. No test here can collide with,
+# observe, or affect a real running CatLocker, or any other test's objects.
+#
+# Protocol: each child process is
+#   python -c <_NATIVE_HELPER_SRC> <app_name> <mode>
+# It always prints exactly one line -- "OWNER" or "DUPLICATE" -- immediately
+# after `acquire()` returns, flushes, and then behaves per `mode`:
+#   - "report_only": closes the guard and exits 0 right away.
+#   - "acquire_then_block": a duplicate exits 0 immediately; an owner sleeps
+#     (up to 30s) so the parent test can force-kill it while it still holds
+#     the mutex. This is what makes "simultaneous acquisition" and "forced
+#     termination" deterministic rather than a timing gamble: the owner
+#     provably still holds the lock at the moment the test acts.
+#   - "owner_poll_activation": must acquire as owner (exits 1 otherwise);
+#     polls `poll_activation()` on a bounded loop and prints "ACTIVATED" (or
+#     "TIMEOUT" then exits 1) as soon as a signal is observed.
+#   - "duplicate_request_activation": must acquire as duplicate (exits 1
+#     otherwise); calls `request_activation(timeout=2.0)` and prints
+#     "ACTIVATED" or "FAILED".
+#
+# The parent test process never waits unboundedly: every subprocess read
+# uses either `communicate(timeout=...)` or the queue-backed `_LineReader`
+# below, and every test's `finally` block force-kills and reaps only the
+# subprocess(es) it itself spawned (`_cleanup_processes`) -- no other
+# process on the machine, and never the real `CatLocker` mutex/event
+# namespace, is touched.
+
+_NATIVE_TEST_ROOT = Path(__file__).resolve().parents[1]
+
+_NATIVE_HELPER_SRC = r"""
+import sys
+import time
+
+from single_instance import InstanceGuard
+
+app_name = sys.argv[1]
+mode = sys.argv[2]
+
+guard = InstanceGuard(app_name=app_name)
+result = guard.acquire()
+print("OWNER" if result.is_owner else "DUPLICATE", flush=True)
+
+if mode == "report_only":
+    guard.close()
+    sys.exit(0)
+
+if mode == "acquire_then_block":
+    if not result.is_owner:
+        sys.exit(0)
+    time.sleep(30)  # the parent test force-kills the owner well before this elapses
+    sys.exit(1)  # pragma: no cover - should never be reached
+
+if mode == "owner_poll_activation":
+    if not result.is_owner:
+        sys.exit(1)
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        if guard.poll_activation():
+            print("ACTIVATED", flush=True)
+            guard.close()
+            sys.exit(0)
+        time.sleep(0.02)
+    print("TIMEOUT", flush=True)
+    guard.close()
+    sys.exit(1)
+
+if mode == "duplicate_request_activation":
+    if result.is_owner:
+        sys.exit(1)
+    ok = guard.request_activation(timeout=2.0)
+    print("ACTIVATED" if ok else "FAILED", flush=True)
+    guard.close()
+    sys.exit(0)
+
+sys.exit(2)  # unknown mode
+"""
+
+
+def _spawn_native_child(app_name: str, mode: str) -> subprocess.Popen:
+    """Launch a real Python subprocess running `_NATIVE_HELPER_SRC`.
+
+    `cwd=_NATIVE_TEST_ROOT` (the repo root) so `import single_instance`
+    resolves in the child without mutating `sys.path` from inside the
+    injected script.
+    """
+
+    return subprocess.Popen(
+        [sys.executable, "-c", _NATIVE_HELPER_SRC, app_name, mode],
+        cwd=_NATIVE_TEST_ROOT,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _cleanup_processes(procs: list[subprocess.Popen]) -> None:
+    """Force-terminate and reap only the given (test-owned) subprocesses.
+
+    Safe to call on processes that already exited on their own. Never
+    touches any process this test did not itself spawn.
+    """
+
+    for proc in procs:
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if proc.stdout is not None:
+            proc.stdout.close()
+        if proc.stderr is not None:
+            proc.stderr.close()
+
+
+class _LineReader:
+    """Reads a subprocess's stdout on a background thread into a queue so a
+    test can wait for a specific line with a bounded timeout even while the
+    child process is still running (e.g. blocked in a poll loop).
+    """
+
+    def __init__(self, stream) -> None:
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, args=(stream,), daemon=True)
+        self._thread.start()
+
+    def _run(self, stream) -> None:
+        try:
+            for line in iter(stream.readline, ""):
+                self._queue.put(line.rstrip("\n"))
+        finally:
+            self._queue.put(None)
+
+    def next_line(self, timeout: float) -> str | None:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+
+@pytest.fixture
+def unique_app_name() -> str:
+    """A fresh per-test app_name, guaranteeing mutex/event names disjoint
+    from any real CatLocker instance and from every other test run."""
+
+    return f"CatLockerNativeTest-{uuid.uuid4().hex}"
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Native InstanceGuard races require real Win32 mutex/event objects.",
+)
+class TestNativeInstanceRaces:
+    """Subprocess-based tests against the real `Win32InstanceAdapter`.
+
+    These are the only tests in this file that exercise real
+    `CreateMutexW`/`CreateEventW`/`OpenEventW`/`WaitForSingleObject` calls
+    under genuine multi-process contention, rather than `FakeInstanceAdapter`.
+    """
+
+    def test_simultaneous_acquisition_yields_exactly_one_owner(self, unique_app_name):
+        # All three race for the same name; the owner holds the mutex
+        # (blocked in "acquire_then_block") for up to 30s, so every straggler
+        # among the three is guaranteed to still see it held when it attempts
+        # its own acquire() -- this is genuine contention, not a timing gamble.
+        procs = [_spawn_native_child(unique_app_name, "acquire_then_block") for _ in range(3)]
+        try:
+            roles = []
+            for proc in procs:
+                reader = _LineReader(proc.stdout)
+                line = reader.next_line(timeout=10)
+                assert line in ("OWNER", "DUPLICATE"), (
+                    f"child produced no role line (got {line!r})"
+                )
+                roles.append(line)
+        finally:
+            _cleanup_processes(procs)
+
+        assert roles.count("OWNER") == 1, roles
+        assert roles.count("DUPLICATE") == len(procs) - 1, roles
+
+    def test_activation_event_delivered_to_polling_owner(self, unique_app_name):
+        owner = _spawn_native_child(unique_app_name, "owner_poll_activation")
+        try:
+            reader = _LineReader(owner.stdout)
+            first = reader.next_line(timeout=10)
+            assert first == "OWNER", f"owner did not acquire ownership (got {first!r})"
+
+            duplicate = _spawn_native_child(unique_app_name, "duplicate_request_activation")
+            try:
+                dup_out, dup_err = duplicate.communicate(timeout=10)
+            finally:
+                _cleanup_processes([duplicate])
+            assert duplicate.returncode == 0, f"duplicate child failed: {dup_err}"
+            assert dup_out.strip().splitlines() == ["DUPLICATE", "ACTIVATED"]
+
+            # Headline assertion: the owner's own poll loop -- real
+            # WaitForSingleObject(handle, 0) calls -- eventually observes the
+            # duplicate's SetEvent. The read timeout here is intentionally
+            # longer than the child's own 10s internal poll deadline above,
+            # so a slow (e.g. antivirus-loaded CI) machine gets the child's
+            # own "TIMEOUT" line and a clear assertion failure instead of
+            # this read racing the child's deadline.
+            activated = reader.next_line(timeout=12)
+            assert activated == "ACTIVATED", "owner never observed the activation signal"
+
+            assert owner.wait(timeout=10) == 0
+        finally:
+            _cleanup_processes([owner])
+
+    def test_owner_normal_exit_allows_fresh_acquisition_afterward(self, unique_app_name):
+        first = _spawn_native_child(unique_app_name, "report_only")
+        try:
+            out, err = first.communicate(timeout=10)
+        finally:
+            _cleanup_processes([first])
+        assert first.returncode == 0, f"child failed: {err}"
+        assert out.strip() == "OWNER"
+
+        second = _spawn_native_child(unique_app_name, "report_only")
+        try:
+            out2, err2 = second.communicate(timeout=10)
+        finally:
+            _cleanup_processes([second])
+        assert second.returncode == 0, f"child failed: {err2}"
+        # Headline assertion: a normal owner exit (guard.close(), releasing
+        # and closing the mutex handle) leaves no stale lock behind -- the
+        # very next acquisition on the same name is again the owner.
+        assert out2.strip() == "OWNER"
+
+    def test_owner_forced_termination_allows_fresh_acquisition_afterward(self, unique_app_name):
+        owner = _spawn_native_child(unique_app_name, "acquire_then_block")
+        try:
+            reader = _LineReader(owner.stdout)
+            first = reader.next_line(timeout=10)
+            assert first == "OWNER", f"owner did not acquire ownership (got {first!r})"
+
+            # Simulate a crash: force-kill before InstanceGuard.close() (and
+            # therefore ReleaseMutex/CloseHandle) ever runs.
+            owner.kill()
+            assert owner.wait(timeout=10) is not None
+        finally:
+            _cleanup_processes([owner])
+
+        second = _spawn_native_child(unique_app_name, "report_only")
+        try:
+            out, err = second.communicate(timeout=10)
+        finally:
+            _cleanup_processes([second])
+        assert second.returncode == 0, f"child failed: {err}"
+        # Headline assertion: the kernel reclaims a process-owned mutex on
+        # termination even without a graceful InstanceGuard.close() call --
+        # process exit or a crash must never leave a stale lock behind.
+        assert out.strip() == "OWNER"

@@ -19,8 +19,20 @@ Upgrading from a version that only had a single Lock keyboard shortcut and a sin
 - Uses one transparent `WH_KEYBOARD_LL` low-level keyboard hook.
 - Does not install a mouse hook.
 - Always starts unlocked, including on login startup.
+- Allows only one running instance per Windows user session.
 - Stores local configuration only.
 - Does not include telemetry, network access, or an update checker.
+
+## Single instance
+
+CatLocker allows only one running instance per Windows user session. This holds regardless of whether the running copy is installed or portable, and regardless of where the executable lives — an installed copy and a portable copy launched in the same session still contend for the same single instance.
+
+If CatLocker is launched again while it is already running — for example, accidentally double-clicking the executable a second time, or a second login-startup launch racing against one that is already running — the second launch never starts a second copy and never installs a second keyboard hook. Instead it reaches the already-running instance and activates it:
+
+- If the existing instance is unlocked, the second launch raises its Settings window.
+- If the existing instance is locked, the second launch shows a brief **CatLocker is already running; the keyboard is locked.** message and exits. It never changes lock state — it does not lock, unlock, or toggle anything on your behalf.
+- A duplicate automatic-startup launch (the `--startup` flag Windows uses to start CatLocker at login) exits silently with no dialog at all. This is the expected outcome, not a bug: Windows commonly races a login-startup launch against an instance that is already running from a previous session or a manual start.
+- If the existing instance can't be reached — for example, it is still starting up — the second launch shows **CatLocker is already running. Look for its icon in the Windows system tray.** and exits. It never falls back to starting a second hook.
 
 ## Recovery paths
 

@@ -127,3 +127,32 @@ This section preserves the earlier results above and records the shortcut-modes 
 | Emergency unlock in both modes | PENDING | While locked in single mode, press the exact `Left Ctrl + Right Ctrl` chord and verify it unlocks; switch to separate mode with distinct lock/unlock bindings, lock again, and verify the same chord still unlocks |
 
 No hardware result is inferred from the automated tests; every row above remains pending until exercised on the target Windows keyboard and layouts.
+
+## Single Instance Retest — 2026-09-09
+
+This section preserves the earlier results above and records the single-instance (session-scoped `InstanceGuard` mutex/event ownership and activation) implementation separately.
+
+- Build commit: `main` at the tip of the single-instance plan (see final commit reported with this checklist update)
+- Fresh executable: `py build.py` succeeded; `dist\CatLocker.exe` confirmed to bundle `single_instance` (checked `build\CatLocker\PYZ-00.toc`)
+- Windows version: 11 Pro (10.0.26200), the same machine this implementation session ran on
+- Second Windows session or account available: not available this session
+- Automated result: complete Python suite passed (597 tests, 0 skipped), including the Windows-only subprocess tests in `tests/test_single_instance.py::TestNativeInstanceRaces` described below the table.
+- Non-visual physical verification performed against the real packaged `dist\CatLocker.exe` this session (process lists via `tasklist`, exit codes, and the real `%LOCALAPPDATA%\CatLocker\config.toml` file — no on-screen/GUI confirmation, see note below the table for why): repeated launch, simultaneous launch, duplicate `--startup`, and forced-termination-then-restart all behaved correctly (see per-row notes). Every check that requires seeing the screen (Settings window, the locked-instance dialog, tray icon count) or locking the real keyboard was deliberately left for a human to verify — see the note below the table.
+- Overall result: partially verified by process-level evidence; full visual/GUI and locked-state verification still pending
+
+| Physical scenario | Result | Reproduction / evidence required |
+|---|---|---|
+| Repeated launch of packaged build | PARTIAL | Launched `dist\CatLocker.exe`, then launched a second copy while the first ran: the second exited with code 0 within ~1s and `tasklist` showed the original two `CatLocker.exe` processes unchanged (no second hook). **Not confirmed:** that the raised window is visually the existing Settings window (requires eyes on screen) |
+| Simultaneous launch | PARTIAL | Started two copies of `dist\CatLocker.exe` within the same second: `tasklist` showed the same pre-existing two-process pair afterward, with no additional `CatLocker.exe` processes — exactly one owner. **Not confirmed:** visual single tray icon |
+| Locked launch | PENDING (not attempted) | Deliberately not exercised this session: triggering it requires actually locking the real keyboard on the machine this implementation session was running on, which would have interrupted the interactive terminal session doing the work. Needs a human to lock CatLocker, launch it again, and verify the exact message "CatLocker is already running; the keyboard is locked." appears, lock state is unchanged, and no second hook starts |
+| Unsaved Settings drafts survive reopen | PENDING (not attempted) | Requires interacting with the real Settings window (open it, start an edit/recording, trigger a duplicate launch, confirm the draft is still there) — needs a human at the keyboard/screen |
+| Duplicate `--startup` launch | CONFIRMED (process-level) | Ran `dist\CatLocker.exe --startup` while the app was already running: exited with code 0 in under a second, `tasklist` showed no new process, and no window was requested to open (activation for `--startup` duplicates is skipped entirely in code, confirmed both by this run and by `tests/test_main.py`'s `test_main_duplicate_startup_launch_exits_quietly_without_activation_or_dialog`) |
+| Installed and portable configs remain untouched | PENDING (not attempted) | Only one config path (`%LOCALAPPDATA%\CatLocker\config.toml`) was exercised this session; a real installed-vs-portable pair with distinct configs was not set up |
+| Owner crash and restart | CONFIRMED | Force-terminated the running `CatLocker.exe` processes via `taskkill /F`, then relaunched: the new launch acquired ownership immediately (new PIDs, no error), with no stale-lock failure. The real `config.toml` was verified byte-for-byte unchanged before and after this whole session's testing |
+| Standard and elevated launches, both orders | PENDING (not attempted) | Requires launching once as a normal user and once elevated ("Run as administrator"), in both orders — not exercised this session |
+| One tray icon and hook maintained throughout | PARTIAL | Process-pair count stayed constant (never more than one hook/tray process pair) across every launch scenario tried this session. **Not confirmed:** visual tray icon count |
+| Startup launch stays quiet | CONFIRMED (process-level) | See "Duplicate `--startup` launch" row — exit code 0, no new process, under a second |
+| Locked status visible with notifications off | PENDING (not attempted) | Requires locking CatLocker with notifications disabled — not exercised this session for the same reason as "Locked launch" above |
+| Session/account independence | PENDING | No second Windows session or account was available this session |
+
+**Why some rows were deliberately skipped rather than attempted and guessed at:** this implementation session ran interactively on the same physical machine and keyboard being used to do the work. Actually triggering Cat Mode's locked state would have intercepted that same keyboard mid-session, and confirming on-screen behavior (the Settings window, the locked-instance dialog, tray icon count) would have required a full-desktop screenshot tool that cannot be scoped to just the CatLocker window — both were judged too disruptive/risky to attempt unsupervised. Everything above marked CONFIRMED or PARTIAL was verified through `tasklist`/exit-code/file evidence against the real packaged executable, not simulated. Rows marked PENDING genuinely need a human at the keyboard and screen.
