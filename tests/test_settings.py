@@ -1,18 +1,28 @@
+import json
 from pathlib import Path
 
 import pytest
 
-from hotkeys import ShortcutError
+from hotkeys import ShortcutError, ShortcutPair, parse_shortcut
 from settings import (
     RUN_KEY,
     STARTUP_VALUE,
     AppSettings,
     StartupRegistry,
     build_startup_command,
+    encode_settings,
     load_settings,
     resolve_config_path,
     save_settings,
 )
+
+
+def _toml_literal(value):
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return json.dumps(value)
+    return repr(value)
 
 
 def test_installed_mode_uses_local_appdata(tmp_path):
@@ -32,6 +42,8 @@ def test_missing_config_is_created_with_safe_defaults(tmp_path):
     path = tmp_path / "config.toml"
     settings = load_settings(path)
     assert settings == AppSettings(toggle_hotkey="F24", notifications=True)
+    assert settings.separate_shortcuts is False
+    assert settings.active_shortcuts() == ShortcutPair(parse_shortcut("F24"), parse_shortcut("F24"))
     assert path.exists()
 
 
@@ -45,6 +57,206 @@ def test_invalid_hotkey_falls_back_to_f24_without_losing_notification_choice(tmp
     path = tmp_path / "config.toml"
     path.write_text('toggle_hotkey = "ctrl"\nnotifications = false\n', encoding="utf-8")
     assert load_settings(path) == AppSettings("F24", False)
+
+
+# --- Shortcut-mode migration precedence -------------------------------------------------
+
+MIGRATION_CASES = [
+    pytest.param("", False, "F24", "F24", "F24", id="fresh"),
+    pytest.param('toggle_hotkey = "F12"\n', False, "F12", "F12", "F12", id="legacy-toggle-only"),
+    pytest.param(
+        'lock_hotkey = "F23"\nunlock_hotkey = "F23"\n',
+        False, "F23", "F23", "F23",
+        id="equal-pair",
+    ),
+    pytest.param(
+        'lock_hotkey = "F23"\nunlock_hotkey = "F24"\n',
+        True, "F23", "F23", "F24",
+        id="distinct-pair",
+    ),
+    pytest.param(
+        'toggle_hotkey = "F12"\nlock_hotkey = "F24"\nunlock_hotkey = "F24"\n',
+        False, "F24", "F24", "F24",
+        id="equal-pair-plus-legacy-toggle-no-flag",
+    ),
+    pytest.param(
+        'separate_shortcuts = false\ntoggle_hotkey = "F12"\nlock_hotkey = "F23"\nunlock_hotkey = "F24"\n',
+        False, "F12", "F23", "F24",
+        id="explicit-false-toggle-and-distinct-pair",
+    ),
+    pytest.param(
+        'separate_shortcuts = true\ntoggle_hotkey = "F12"\nlock_hotkey = "F23"\n',
+        True, "F12", "F23", "F12",
+        id="explicit-true-toggle-and-lock-only",
+    ),
+    pytest.param(
+        'separate_shortcuts = 1\nlock_hotkey = "F23"\nunlock_hotkey = "F24"\n',
+        True, "F23", "F23", "F24",
+        id="invalid-flag-with-distinct-pair",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "content, expected_separate, expected_toggle, expected_lock, expected_unlock",
+    MIGRATION_CASES,
+)
+def test_migration_precedence_table(
+    tmp_path, content, expected_separate, expected_toggle, expected_lock, expected_unlock
+):
+    path = tmp_path / "config.toml"
+    path.write_text(content, encoding="utf-8")
+    original_bytes = path.read_bytes()
+
+    settings = load_settings(path)
+
+    assert settings.separate_shortcuts is expected_separate
+    assert settings.toggle_hotkey == expected_toggle
+    assert settings.lock_hotkey == expected_lock
+    assert settings.unlock_hotkey == expected_unlock
+
+    expected_pair = (
+        ShortcutPair(parse_shortcut(expected_lock), parse_shortcut(expected_unlock))
+        if expected_separate
+        else ShortcutPair(parse_shortcut(expected_toggle), parse_shortcut(expected_toggle))
+    )
+    assert settings.active_shortcuts() == expected_pair
+
+    # Migration alone must never rewrite an otherwise readable file.
+    assert path.read_bytes() == original_bytes
+
+
+def test_invalid_lock_falls_back_to_toggle_then_default(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('lock_hotkey = "NotAKey"\nunlock_hotkey = "F23"\n', encoding="utf-8")
+    settings = load_settings(path)
+    assert settings.lock_hotkey == "F24"
+    assert settings.unlock_hotkey == "F23"
+    assert settings.toggle_hotkey == "F24"
+    assert settings.separate_shortcuts is True
+
+
+def test_missing_unlock_falls_back_to_default_and_infers_separate_mode(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('lock_hotkey = "F23"\n', encoding="utf-8")
+    settings = load_settings(path)
+    assert settings.lock_hotkey == "F23"
+    assert settings.unlock_hotkey == "F24"
+    assert settings.toggle_hotkey == "F23"
+    assert settings.separate_shortcuts is True
+
+
+def test_explicit_separate_mode_survives_equal_resolved_pair_from_invalid_toggle(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text('separate_shortcuts = true\ntoggle_hotkey = "bogus"\n', encoding="utf-8")
+    settings = load_settings(path)
+    assert settings.lock_hotkey == "F24"
+    assert settings.unlock_hotkey == "F24"
+    assert settings.toggle_hotkey == "F24"
+    assert settings.separate_shortcuts is True
+
+
+@pytest.mark.parametrize("bad_flag", [1, 0, "true", "false", 1.5])
+def test_invalid_mode_flag_types_fall_back_to_pair_inference(tmp_path, bad_flag):
+    path = tmp_path / "config.toml"
+    literal = _toml_literal(bad_flag)
+    path.write_text(
+        f'separate_shortcuts = {literal}\nlock_hotkey = "F23"\nunlock_hotkey = "F24"\n',
+        encoding="utf-8",
+    )
+    settings = load_settings(path)
+    assert settings.separate_shortcuts is True
+    assert settings.toggle_hotkey == "F23"
+    assert settings.lock_hotkey == "F23"
+    assert settings.unlock_hotkey == "F24"
+
+
+@pytest.mark.parametrize("bad_notifications", [1, 0, "true", "yes"])
+def test_invalid_notifications_type_falls_back_to_default(tmp_path, bad_notifications):
+    path = tmp_path / "config.toml"
+    literal = _toml_literal(bad_notifications)
+    path.write_text(f"notifications = {literal}\n", encoding="utf-8")
+    settings = load_settings(path)
+    assert settings.notifications is True
+
+
+def test_generic_and_specific_modifiers_preserved_across_all_three_fields(tmp_path):
+    path = tmp_path / "config.toml"
+    settings = AppSettings(
+        toggle_hotkey="Ctrl+F13",
+        lock_hotkey="LCtrl+F14",
+        unlock_hotkey="RCtrl+F15",
+        separate_shortcuts=True,
+    )
+    save_settings(path, settings)
+
+    loaded = load_settings(path)
+
+    assert loaded.toggle_hotkey == "Ctrl+F13"
+    assert loaded.lock_hotkey == "LCtrl+F14"
+    assert loaded.unlock_hotkey == "RCtrl+F15"
+
+
+def test_round_trip_preserves_inactive_bindings_and_active_pair(tmp_path):
+    path = tmp_path / "config.toml"
+    single = AppSettings(
+        toggle_hotkey="F12",
+        lock_hotkey="F23",
+        unlock_hotkey="F24",
+        separate_shortcuts=False,
+    )
+    save_settings(path, single)
+    loaded_single = load_settings(path)
+    assert loaded_single == single
+    assert loaded_single.active_shortcuts() == ShortcutPair(parse_shortcut("F12"), parse_shortcut("F12"))
+
+    separate = AppSettings(
+        toggle_hotkey="F12",
+        lock_hotkey="F23",
+        unlock_hotkey="F24",
+        separate_shortcuts=True,
+    )
+    save_settings(path, separate)
+    loaded_separate = load_settings(path)
+    assert loaded_separate == separate
+    assert loaded_separate.active_shortcuts() == ShortcutPair(parse_shortcut("F23"), parse_shortcut("F24"))
+
+
+def test_encode_settings_serializes_all_fields():
+    settings = AppSettings(
+        toggle_hotkey="F12",
+        lock_hotkey="F23",
+        unlock_hotkey="F24",
+        separate_shortcuts=True,
+        notifications=False,
+    )
+    text = encode_settings(settings)
+    assert 'separate_shortcuts = true' in text
+    assert 'toggle_hotkey = "F12"' in text
+    assert 'lock_hotkey = "F23"' in text
+    assert 'unlock_hotkey = "F24"' in text
+    assert 'notifications = false' in text
+
+
+def test_positional_construction_defaults_to_single_mode():
+    settings = AppSettings("F12", True)
+    assert settings.separate_shortcuts is False
+    assert settings.toggle_hotkey == settings.lock_hotkey == settings.unlock_hotkey == "F12"
+
+
+def test_pair_only_construction_infers_mode_from_equality():
+    equal_pair = AppSettings(lock_hotkey="F23", unlock_hotkey="F23")
+    assert equal_pair.separate_shortcuts is False
+    assert equal_pair.toggle_hotkey == "F23"
+
+    distinct_pair = AppSettings(lock_hotkey="F23", unlock_hotkey="F24")
+    assert distinct_pair.separate_shortcuts is True
+    assert distinct_pair.toggle_hotkey == "F23"
+
+
+def test_explicit_mode_overrides_pair_inference():
+    settings = AppSettings(lock_hotkey="F23", unlock_hotkey="F23", separate_shortcuts=True)
+    assert settings.separate_shortcuts is True
 
 
 def test_corrupt_toml_is_preserved_before_defaults_are_written(tmp_path):

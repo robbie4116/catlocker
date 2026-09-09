@@ -7,28 +7,77 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-from hotkeys import ShortcutError, parse_shortcut, validate_shortcut
+from hotkeys import ShortcutError, ShortcutPair, parse_shortcut, validate_shortcut
 
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_VALUE = "CatLocker"
 
+_UNSET = object()
+
 
 @dataclass(frozen=True, slots=True, init=False)
 class AppSettings:
+    separate_shortcuts: bool = False
+    toggle_hotkey: str = "F24"
     lock_hotkey: str = "F24"
     unlock_hotkey: str = "F24"
     notifications: bool = True
 
-    def __init__(self, toggle_hotkey="F24", notifications=True, *, lock_hotkey=None, unlock_hotkey=None):
-        object.__setattr__(self, "lock_hotkey", toggle_hotkey if lock_hotkey is None else lock_hotkey)
-        object.__setattr__(self, "unlock_hotkey", toggle_hotkey if unlock_hotkey is None else unlock_hotkey)
+    def __init__(
+        self,
+        toggle_hotkey=_UNSET,
+        notifications=True,
+        *,
+        lock_hotkey=None,
+        unlock_hotkey=None,
+        separate_shortcuts=None,
+    ):
+        """Construct settings.
+
+        Preserves two legacy call shapes alongside the new explicit-mode one:
+
+        - Old positional toggle/notifications construction, e.g. ``AppSettings("F12", True)``:
+          no pair is supplied, so mode defaults to single and lock/unlock are seeded from toggle.
+        - Old pair-only keyword construction, e.g. ``AppSettings(lock_hotkey=..., unlock_hotkey=...)``:
+          with no explicit mode, mode is inferred from whether the pair is equal, and toggle is
+          seeded from lock (matching the file-migration rules for equal/distinct pairs).
+
+        An explicitly supplied ``separate_shortcuts`` always wins over inference.
+        """
+        pair_supplied = lock_hotkey is not None or unlock_hotkey is not None
+        toggle_supplied = toggle_hotkey is not _UNSET
+
+        if pair_supplied:
+            fallback = toggle_hotkey if toggle_supplied else "F24"
+            resolved_lock = lock_hotkey if lock_hotkey is not None else fallback
+            resolved_unlock = unlock_hotkey if unlock_hotkey is not None else fallback
+        else:
+            resolved_lock = resolved_unlock = toggle_hotkey if toggle_supplied else "F24"
+
+        if separate_shortcuts is not None:
+            resolved_separate = bool(separate_shortcuts)
+        elif pair_supplied:
+            resolved_separate = resolved_lock != resolved_unlock
+        else:
+            resolved_separate = False
+
+        resolved_toggle = toggle_hotkey if toggle_supplied else resolved_lock
+
+        object.__setattr__(self, "separate_shortcuts", resolved_separate)
+        object.__setattr__(self, "toggle_hotkey", resolved_toggle)
+        object.__setattr__(self, "lock_hotkey", resolved_lock)
+        object.__setattr__(self, "unlock_hotkey", resolved_unlock)
         object.__setattr__(self, "notifications", notifications)
 
-    @property
-    def toggle_hotkey(self):
-        """Compatibility alias for callers using the old single-shortcut API."""
-        return self.lock_hotkey
+    def active_shortcuts(self) -> ShortcutPair:
+        """The pair that should actually be installed: lock/unlock when separate, toggle/toggle otherwise.
+
+        Centralizes selection so application startup and Settings Save cannot disagree.
+        """
+        if self.separate_shortcuts:
+            return ShortcutPair(parse_shortcut(self.lock_hotkey), parse_shortcut(self.unlock_hotkey))
+        return ShortcutPair(parse_shortcut(self.toggle_hotkey), parse_shortcut(self.toggle_hotkey))
 
 
 def build_startup_command(
@@ -111,8 +160,11 @@ def resolve_config_path(executable_dir: Path, local_appdata: Path) -> Path:
 
 def encode_settings(settings: AppSettings) -> str:
     import json
+    separate_shortcuts = "true" if settings.separate_shortcuts else "false"
     notifications = "true" if settings.notifications else "false"
-    return (f'lock_hotkey = {json.dumps(settings.lock_hotkey)}\n'
+    return (f'separate_shortcuts = {separate_shortcuts}\n'
+            f'toggle_hotkey = {json.dumps(settings.toggle_hotkey)}\n'
+            f'lock_hotkey = {json.dumps(settings.lock_hotkey)}\n'
             f'unlock_hotkey = {json.dumps(settings.unlock_hotkey)}\n'
             f'notifications = {notifications}\n')
 
@@ -125,8 +177,10 @@ def _canonicalize_hotkey(raw: str) -> str:
 
 def _canonicalize_settings(settings: AppSettings) -> AppSettings:
     return AppSettings(
+        toggle_hotkey=_canonicalize_hotkey(settings.toggle_hotkey),
         lock_hotkey=_canonicalize_hotkey(settings.lock_hotkey),
         unlock_hotkey=_canonicalize_hotkey(settings.unlock_hotkey),
+        separate_shortcuts=settings.separate_shortcuts,
         notifications=settings.notifications,
     )
 
@@ -144,6 +198,16 @@ def _preserve_corrupt(path: Path) -> None:
     os.replace(path, _corrupt_backup_path(path))
 
 
+def _canonical_or_none(raw: object) -> str | None:
+    """A shortcut value resolved for use, or None if missing or invalid ("unavailable")."""
+    if not isinstance(raw, str):
+        return None
+    try:
+        return _canonicalize_hotkey(raw)
+    except ShortcutError:
+        return None
+
+
 def load_settings(path: Path) -> AppSettings:
     path = Path(path)
     if not path.exists():
@@ -158,28 +222,47 @@ def load_settings(path: Path) -> AppSettings:
         save_settings(path, AppSettings())
         return AppSettings()
 
-    hotkey = AppSettings().toggle_hotkey
-    raw_hotkey = loaded.get("toggle_hotkey") if isinstance(loaded, dict) else None
-    if isinstance(raw_hotkey, str):
-        try:
-            hotkey = _canonicalize_hotkey(raw_hotkey)
-        except ShortcutError:
-            pass
+    data = loaded if isinstance(loaded, dict) else {}
+    defaults = AppSettings()
 
-    notifications = AppSettings().notifications
-    raw_notifications = loaded.get("notifications") if isinstance(loaded, dict) else None
+    valid_toggle = _canonical_or_none(data.get("toggle_hotkey"))
+    valid_lock = _canonical_or_none(data.get("lock_hotkey"))
+    valid_unlock = _canonical_or_none(data.get("unlock_hotkey"))
+
+    # Resolve lock/unlock independently of mode: lock_hotkey/unlock_hotkey win when valid,
+    # falling back to toggle_hotkey, then F24. This is what lets remembered inactive bindings
+    # survive even when they don't match the active mode.
+    resolved_lock = valid_lock if valid_lock is not None else (
+        valid_toggle if valid_toggle is not None else defaults.lock_hotkey
+    )
+    resolved_unlock = valid_unlock if valid_unlock is not None else (
+        valid_toggle if valid_toggle is not None else defaults.unlock_hotkey
+    )
+
+    raw_mode = data.get("separate_shortcuts")
+    if isinstance(raw_mode, bool):
+        # A valid explicit mode flag always wins; toggle is resolved independently,
+        # falling back to the resolved lock binding.
+        resolved_toggle = valid_toggle if valid_toggle is not None else resolved_lock
+        resolved_separate = raw_mode
+    else:
+        # No valid mode flag: seed toggle from the resolved lock binding and infer mode
+        # from whether the resolved pair differs, preserving older mixed files' active binding.
+        resolved_toggle = resolved_lock
+        resolved_separate = resolved_lock != resolved_unlock
+
+    resolved_notifications = defaults.notifications
+    raw_notifications = data.get("notifications")
     if isinstance(raw_notifications, bool):
-        notifications = raw_notifications
+        resolved_notifications = raw_notifications
 
-    def read_hotkey(name):
-        try:
-            return _canonicalize_hotkey(loaded.get(name, hotkey))
-        except ShortcutError:
-            return hotkey
-
-    return AppSettings(lock_hotkey=read_hotkey("lock_hotkey"),
-                       unlock_hotkey=read_hotkey("unlock_hotkey"),
-                       notifications=notifications)
+    return AppSettings(
+        toggle_hotkey=resolved_toggle,
+        lock_hotkey=resolved_lock,
+        unlock_hotkey=resolved_unlock,
+        separate_shortcuts=resolved_separate,
+        notifications=resolved_notifications,
+    )
 
 
 def save_settings(

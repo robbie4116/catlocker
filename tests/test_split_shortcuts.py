@@ -32,10 +32,21 @@ def test_settings_migration_and_roundtrip(tmp_path):
     path.write_text('toggle_hotkey = "Ctrl+F12"\n')
     migrated = load_settings(path)
     assert migrated.lock_hotkey == migrated.unlock_hotkey == 'Ctrl+F12'
+    assert migrated.toggle_hotkey == 'Ctrl+F12'
+    assert migrated.separate_shortcuts is False
+
     settings = AppSettings(lock_hotkey='F23', unlock_hotkey='F24')
+    assert settings.separate_shortcuts is True
+    assert settings.toggle_hotkey == 'F23'
     save_settings(path, settings)
-    assert load_settings(path) == settings
-    assert 'toggle_hotkey' not in path.read_text()
+    reloaded = load_settings(path)
+    assert reloaded == settings
+    # All remembered values -- mode, toggle, and both pair members -- survive the round trip.
+    text = path.read_text()
+    assert 'toggle_hotkey' in text
+    assert 'separate_shortcuts' in text
+    assert 'lock_hotkey' in text
+    assert 'unlock_hotkey' in text
 
 
 def test_unlock_while_lock_trigger_is_still_held():
